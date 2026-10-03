@@ -1,0 +1,6 @@
+{
+  "name": "OpenChat — Public Group Chat",
+  "description": "Real-time public group chat with Firestore persistence and server-side clear controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

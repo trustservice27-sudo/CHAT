@@ -1,0 +1,44 @@
+{
+  "entities": {
+    "Message": {
+      "title": "Message",
+      "description": "A public group chat message sent by an authenticated verified user",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who posted the message",
+          "maxLength": 128
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Sender display name",
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Optional sender avatar URL",
+          "maxLength": 1000
+        },
+        "text": {
+          "type": "string",
+          "description": "Chat message content (1 to 2000 chars)",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of message creation"
+        }
+      },
+      "required": ["userId", "displayName", "text", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Live public group chat messages collection"
+    }
+  }
+}
