@@ -12,6 +12,11 @@ export interface ChatMessage {
 export interface ChatUser {
   uid: string;
   displayName: string;
-  avatarColor?: string;
   photoURL?: string;
+}
+
+export interface OnlineUser {
+  userId: string;
+  displayName: string;
+  lastActive?: Timestamp | { seconds: number; nanoseconds: number } | null;
 }

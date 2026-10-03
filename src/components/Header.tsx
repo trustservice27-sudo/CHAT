@@ -162,7 +162,7 @@ export const Header: React.FC<HeaderProps> = ({
                     className="w-8 h-8 rounded-full object-cover ring-2 ring-indigo-500/30"
                   />
                 ) : (
-                  <div className={`w-8 h-8 rounded-full bg-gradient-to-br ${currentUser.avatarColor || 'from-indigo-500 to-purple-600'} text-white font-bold flex items-center justify-center text-xs ring-2 ring-indigo-500/30 shadow-inner`}>
+                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 text-white font-bold flex items-center justify-center text-xs ring-2 ring-indigo-500/30 shadow-inner">
                     {(currentUser.displayName || 'M')[0].toUpperCase()}
                   </div>
                 )}

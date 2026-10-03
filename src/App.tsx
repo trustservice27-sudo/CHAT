@@ -12,11 +12,13 @@ import {
   limit, 
   onSnapshot, 
   addDoc, 
+  setDoc,
+  doc,
   serverTimestamp, 
   handleFirestoreError, 
   OperationType
 } from './firebase';
-import type { ChatMessage, ChatUser } from './types';
+import type { ChatMessage, ChatUser, OnlineUser } from './types';
 import { Header } from './components/Header';
 import { MessageList } from './components/MessageList';
 import { MessageComposer } from './components/MessageComposer';
@@ -24,7 +26,7 @@ import { AuthModal } from './components/AuthModal';
 import { ClearModal } from './components/ClearModal';
 import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
-import { Loader2, AlertCircle } from 'lucide-react';
+import { Loader2, AlertCircle, Sparkles } from 'lucide-react';
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(() => {
@@ -37,6 +39,7 @@ export default function App() {
   });
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(true);
   const [firestoreError, setFirestoreError] = useState<string | null>(null);
 
@@ -50,7 +53,7 @@ export default function App() {
   const initialLoadDone = useRef(false);
   const prevMessagesCount = useRef(0);
 
-  // 1. Data Fetching (Live real-time public message subscription)
+  // 1. Data Fetching (Live real-time messages from online database)
   useEffect(() => {
     setMessagesLoading(true);
     setFirestoreError(null);
@@ -96,7 +99,7 @@ export default function App() {
       },
       (error) => {
         setMessagesLoading(false);
-        setFirestoreError(error.message || 'Could not fetch live messages.');
+        setFirestoreError(error.message || 'Could not fetch live messages from online database.');
         handleFirestoreError(error, OperationType.GET, path);
       }
     );
@@ -104,8 +107,48 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, soundEnabled]);
 
-  // Join handler (simple name login)
-  const handleJoin = (user: ChatUser) => {
+  // 2. Data Fetching (Live real-time active users from online database)
+  useEffect(() => {
+    const usersPath = 'users';
+    const usersQuery = query(
+      collection(db, usersPath),
+      limit(50)
+    );
+
+    const unsubscribe = onSnapshot(
+      usersQuery,
+      (snapshot) => {
+        const users: OnlineUser[] = snapshot.docs.map((docSnap) => {
+          const data = docSnap.data();
+          return {
+            userId: docSnap.id,
+            displayName: data.displayName || 'Member',
+            lastActive: data.lastActive || null,
+          };
+        });
+        setOnlineUsers(users);
+      },
+      (err) => {
+        console.warn('Online users listener:', err);
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  // Sync current user to online database on initial load if logged in
+  useEffect(() => {
+    if (currentUser) {
+      setDoc(doc(db, 'users', currentUser.uid), {
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        lastActive: serverTimestamp(),
+      }, { merge: true }).catch(() => {});
+    }
+  }, [currentUser]);
+
+  // Join handler (Persist in local storage & save in online database)
+  const handleJoin = async (user: ChatUser) => {
     setCurrentUser(user);
     try {
       localStorage.setItem('openchat_user', JSON.stringify(user));
@@ -113,9 +156,20 @@ export default function App() {
     } catch {
       // Ignore localStorage exceptions in private browsing
     }
+
+    // Save user profile into ONLINE DATABASE (Firestore)
+    try {
+      await setDoc(doc(db, 'users', user.uid), {
+        userId: user.uid,
+        displayName: user.displayName,
+        lastActive: serverTimestamp(),
+      }, { merge: true });
+    } catch (err) {
+      console.warn('Failed to save user to online database', err);
+    }
   };
 
-  // Leave room / Switch name handler
+  // Leave room handler
   const handleSignOut = () => {
     setCurrentUser(null);
     try {
@@ -125,7 +179,7 @@ export default function App() {
     }
   };
 
-  // Send message
+  // Send message directly to ONLINE DATABASE
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
 
@@ -139,6 +193,13 @@ export default function App() {
 
     try {
       await addDoc(collection(db, path), payload);
+
+      // Refresh lastActive in online database
+      setDoc(doc(db, 'users', currentUser.uid), {
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        lastActive: serverTimestamp(),
+      }, { merge: true }).catch(() => {});
     } catch (error) {
       handleFirestoreError(error, OperationType.CREATE, path);
     }
@@ -170,10 +231,42 @@ export default function App() {
         messageCount={messages.length}
       />
 
+      {/* Online Database Active Users Bar */}
+      {currentUser && onlineUsers.length > 0 && (
+        <div className="bg-slate-900/60 border-b border-slate-800/80 px-4 py-2 flex items-center justify-between text-xs">
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-0.5">
+            <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1.5 shrink-0 uppercase tracking-wider mr-1">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              Online Database Members ({onlineUsers.length}):
+            </span>
+            <div className="flex items-center -space-x-1.5 shrink-0">
+              {onlineUsers.slice(0, 10).map((u) => (
+                <div 
+                  key={u.userId}
+                  title={`${u.displayName} (Synced in online database)`}
+                  className="w-6 h-6 rounded-full bg-indigo-600/80 border border-slate-700 text-white font-bold text-[10px] flex items-center justify-center ring-1 ring-slate-900 hover:scale-125 transition-transform hover:z-10"
+                >
+                  {(u.displayName || 'M')[0].toUpperCase()}
+                </div>
+              ))}
+            </div>
+            {onlineUsers.length > 10 && (
+              <span className="text-[10px] text-slate-400 bg-slate-800 px-1.5 py-0.5 rounded-full">
+                +{onlineUsers.length - 10} more
+              </span>
+            )}
+          </div>
+          <span className="text-[10px] text-indigo-400 font-mono hidden md:inline-flex items-center gap-1 shrink-0">
+            <Sparkles className="w-3 h-3" />
+            Cloud Firestore Synced
+          </span>
+        </div>
+      )}
+
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
         {!currentUser ? (
-          /* Simple Name Login Screen */
+          /* Simple Instant Name Login Screen */
           <div className="flex-1 flex items-center justify-center p-4 sm:p-6 overflow-y-auto">
             <AuthModal onJoin={handleJoin} />
           </div>
@@ -193,7 +286,7 @@ export default function App() {
             {messagesLoading ? (
               <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
                 <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                <span className="text-xs">Loading live conversation...</span>
+                <span className="text-xs">Loading live conversation from online database...</span>
               </div>
             ) : (
               <MessageList

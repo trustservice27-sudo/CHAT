@@ -22,6 +22,7 @@ import {
   limit,
   onSnapshot,
   addDoc,
+  setDoc,
   serverTimestamp,
   deleteDoc,
   writeBatch,
@@ -64,7 +65,7 @@ export interface FirestoreErrorInfo {
   };
 }
 
-export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): FirestoreErrorInfo {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -82,7 +83,7 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     path
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  return errInfo;
 }
 
 // Validate Connection to Firestore on startup as mandated by skill
@@ -121,6 +122,7 @@ export {
   deleteDoc,
   writeBatch,
   getDocs,
-  doc
+  doc,
+  setDoc
 };
 export type { User, Timestamp };
