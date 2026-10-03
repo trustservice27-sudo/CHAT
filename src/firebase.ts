@@ -28,6 +28,8 @@ import {
   deleteDoc,
   writeBatch,
   getDocs,
+  updateDoc,
+  arrayUnion,
   type Timestamp
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
@@ -125,6 +127,8 @@ export {
   writeBatch,
   getDocs,
   doc,
-  setDoc
+  setDoc,
+  updateDoc,
+  arrayUnion
 };
 export type { User, Timestamp };

@@ -1,5 +1,11 @@
 import type { Timestamp } from 'firebase/firestore';
 
+export interface SeenUser {
+  userId: string;
+  displayName: string;
+  seenAt?: number;
+}
+
 export interface ChatMessage {
   id: string;
   userId: string;
@@ -7,6 +13,8 @@ export interface ChatMessage {
   photoURL?: string;
   text: string;
   createdAt: Timestamp | { seconds: number; nanoseconds: number } | null;
+  readBy?: string[];
+  seenBy?: SeenUser[];
 }
 
 export interface ChatUser {
@@ -20,3 +28,11 @@ export interface OnlineUser {
   displayName: string;
   lastActive?: Timestamp | { seconds: number; nanoseconds: number } | null;
 }
+
+export interface TypingUser {
+  userId: string;
+  displayName: string;
+  isTyping: boolean;
+  timestamp: number;
+}
+

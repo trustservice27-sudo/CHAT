@@ -13,22 +13,28 @@ import {
   onSnapshot, 
   addDoc, 
   setDoc,
+  updateDoc,
+  arrayUnion,
   doc,
   serverTimestamp, 
   handleFirestoreError, 
   OperationType
 } from './firebase';
-import type { ChatMessage, ChatUser, OnlineUser } from './types';
+import type { ChatMessage, ChatUser, OnlineUser, TypingUser } from './types';
 import { Header } from './components/Header';
 import { MessageList } from './components/MessageList';
 import { MessageComposer } from './components/MessageComposer';
+import { TypingIndicator } from './components/TypingIndicator';
 import { AuthModal } from './components/AuthModal';
 import { ClearModal } from './components/ClearModal';
 import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
+import { useVisualViewport } from './utils/useVisualViewport';
 import { Loader2, AlertCircle, Sparkles } from 'lucide-react';
 
 export default function App() {
+  const { viewportHeight, isKeyboardVisible } = useVisualViewport();
+
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(() => {
     try {
       const saved = localStorage.getItem('openchat_user');
@@ -40,6 +46,7 @@ export default function App() {
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
+  const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(true);
   const [firestoreError, setFirestoreError] = useState<string | null>(null);
 
@@ -48,10 +55,18 @@ export default function App() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [clearModalOpen, setClearModalOpen] = useState(false);
   const [infoModalOpen, setInfoModalOpen] = useState(false);
+  const [scrollTrigger, setScrollTrigger] = useState(0);
 
   // Audio trigger tracking
   const initialLoadDone = useRef(false);
   const prevMessagesCount = useRef(0);
+
+  // Auto-scroll when keyboard opens on mobile
+  useEffect(() => {
+    if (isKeyboardVisible) {
+      setScrollTrigger((prev) => prev + 1);
+    }
+  }, [isKeyboardVisible]);
 
   // 1. Data Fetching (Live real-time messages from online database)
   useEffect(() => {
@@ -77,6 +92,8 @@ export default function App() {
             photoURL: data.photoURL,
             text: data.text || '',
             createdAt: data.createdAt || null,
+            readBy: Array.isArray(data.readBy) ? data.readBy : [],
+            seenBy: Array.isArray(data.seenBy) ? data.seenBy : [],
           };
         });
 
@@ -107,6 +124,33 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, soundEnabled]);
 
+  // Mark other users' messages as seen by current user in real-time
+  useEffect(() => {
+    if (!currentUser || messages.length === 0) return;
+
+    const unreadMessages = messages.filter(
+      (m) =>
+        m.userId &&
+        m.userId !== currentUser.uid &&
+        (!m.readBy || !m.readBy.includes(currentUser.uid))
+    );
+
+    if (unreadMessages.length === 0) return;
+
+    unreadMessages.forEach((msg) => {
+      updateDoc(doc(db, 'messages', msg.id), {
+        readBy: arrayUnion(currentUser.uid),
+        seenBy: arrayUnion({
+          userId: currentUser.uid,
+          displayName: currentUser.displayName,
+          seenAt: Date.now(),
+        }),
+      }).catch((err) => {
+        console.warn('Failed to mark message as seen:', err);
+      });
+    });
+  }, [messages, currentUser]);
+
   // 2. Data Fetching (Live real-time active users from online database)
   useEffect(() => {
     const usersPath = 'users';
@@ -135,6 +179,58 @@ export default function App() {
 
     return () => unsubscribe();
   }, []);
+
+  // 3. Real-time Typing Status Listener
+  useEffect(() => {
+    const typingQuery = query(collection(db, 'typing'));
+
+    const unsubscribe = onSnapshot(
+      typingQuery,
+      (snapshot) => {
+        const now = Date.now();
+        const activeTypers: TypingUser[] = [];
+
+        snapshot.docs.forEach((docSnap) => {
+          const data = docSnap.data();
+          // Exclude self, require isTyping = true, and ignore stale events > 5s old
+          if (
+            data.isTyping &&
+            data.userId !== currentUser?.uid &&
+            data.displayName &&
+            now - (data.timestamp || 0) < 5000
+          ) {
+            activeTypers.push({
+              userId: data.userId || docSnap.id,
+              displayName: data.displayName || 'Someone',
+              isTyping: true,
+              timestamp: data.timestamp || now,
+            });
+          }
+        });
+
+        setTypingUsers(activeTypers);
+
+        // Auto-scroll when someone starts typing if user was near bottom
+        if (activeTypers.length > 0) {
+          setScrollTrigger((prev) => prev + 1);
+        }
+      },
+      (err) => {
+        console.warn('Typing status listener error:', err);
+      }
+    );
+
+    // Periodic sweep to remove expired typing entries
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setTypingUsers((prev) => prev.filter((t) => now - t.timestamp < 5000));
+    }, 2000);
+
+    return () => {
+      unsubscribe();
+      clearInterval(interval);
+    };
+  }, [currentUser]);
 
   // Sync current user to online database on initial load if logged in
   useEffect(() => {
@@ -171,11 +267,36 @@ export default function App() {
 
   // Leave room handler
   const handleSignOut = () => {
+    if (currentUser) {
+      // Clean up typing status
+      setDoc(doc(db, 'typing', currentUser.uid), {
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        isTyping: false,
+        timestamp: Date.now(),
+      }, { merge: true }).catch(() => {});
+    }
+
     setCurrentUser(null);
     try {
       localStorage.removeItem('openchat_user');
     } catch {
       // Ignore
+    }
+  };
+
+  // Broadcast typing status to Firestore
+  const handleTyping = async (isTyping: boolean) => {
+    if (!currentUser) return;
+    try {
+      await setDoc(doc(db, 'typing', currentUser.uid), {
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        isTyping,
+        timestamp: Date.now(),
+      }, { merge: true });
+    } catch (err) {
+      console.warn('Failed to update typing status:', err);
     }
   };
 
@@ -193,6 +314,14 @@ export default function App() {
 
     try {
       await addDoc(collection(db, path), payload);
+
+      // Clear typing status immediately
+      setDoc(doc(db, 'typing', currentUser.uid), {
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        isTyping: false,
+        timestamp: Date.now(),
+      }, { merge: true }).catch(() => {});
 
       // Refresh lastActive in online database
       setDoc(doc(db, 'users', currentUser.uid), {
@@ -216,9 +345,12 @@ export default function App() {
   });
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30">
+    <div 
+      style={{ height: viewportHeight ? `${viewportHeight}px` : undefined }}
+      className="h-dvh max-h-dvh w-full overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30 fixed inset-0"
+    >
       
-      {/* Top Header */}
+      {/* Top Header (shrink-0 fixed at top) */}
       <Header
         currentUser={currentUser}
         onSignOut={handleSignOut}
@@ -231,52 +363,52 @@ export default function App() {
         messageCount={messages.length}
       />
 
-      {/* Online Database Active Users Bar */}
+      {/* Online Database Active Users Bar (shrink-0) */}
       {currentUser && onlineUsers.length > 0 && (
-        <div className="bg-slate-900/60 border-b border-slate-800/80 px-4 py-2 flex items-center justify-between text-xs">
-          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-0.5">
-            <span className="text-[11px] font-semibold text-slate-400 flex items-center gap-1.5 shrink-0 uppercase tracking-wider mr-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              Online Database Members ({onlineUsers.length}):
+        <div className="shrink-0 bg-slate-900/60 border-b border-slate-800/80 px-3 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between text-xs">
+          <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar py-0.5">
+            <span className="text-[10px] sm:text-[11px] font-semibold text-slate-400 flex items-center gap-1 shrink-0 uppercase tracking-wider">
+              <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              Online ({onlineUsers.length}):
             </span>
-            <div className="flex items-center -space-x-1.5 shrink-0">
-              {onlineUsers.slice(0, 10).map((u) => (
+            <div className="flex items-center -space-x-1 shrink-0">
+              {onlineUsers.slice(0, 8).map((u) => (
                 <div 
                   key={u.userId}
-                  title={`${u.displayName} (Synced in online database)`}
-                  className="w-6 h-6 rounded-full bg-indigo-600/80 border border-slate-700 text-white font-bold text-[10px] flex items-center justify-center ring-1 ring-slate-900 hover:scale-125 transition-transform hover:z-10"
+                  title={`${u.displayName} (Online)`}
+                  className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-indigo-600/80 border border-slate-700 text-white font-bold text-[9px] sm:text-[10px] flex items-center justify-center ring-1 ring-slate-900"
                 >
                   {(u.displayName || 'M')[0].toUpperCase()}
                 </div>
               ))}
             </div>
-            {onlineUsers.length > 10 && (
-              <span className="text-[10px] text-slate-400 bg-slate-800 px-1.5 py-0.5 rounded-full">
-                +{onlineUsers.length - 10} more
+            {onlineUsers.length > 8 && (
+              <span className="text-[9px] text-slate-400 bg-slate-800 px-1 py-0.5 rounded-full shrink-0">
+                +{onlineUsers.length - 8}
               </span>
             )}
           </div>
-          <span className="text-[10px] text-indigo-400 font-mono hidden md:inline-flex items-center gap-1 shrink-0">
+          <span className="text-[10px] text-indigo-400 font-mono hidden sm:inline-flex items-center gap-1 shrink-0">
             <Sparkles className="w-3 h-3" />
-            Cloud Firestore Synced
+            Live Cloud
           </span>
         </div>
       )}
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex flex-col overflow-hidden relative">
+      {/* Main Content Area (flex-1 min-h-0) */}
+      <main className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
         {!currentUser ? (
           /* Simple Instant Name Login Screen */
-          <div className="flex-1 flex items-center justify-center p-4 sm:p-6 overflow-y-auto">
+          <div className="flex-1 flex items-center justify-center p-3 sm:p-6 overflow-y-auto">
             <AuthModal onJoin={handleJoin} />
           </div>
         ) : (
-          /* Live Chat Room */
-          <div className="flex-1 flex flex-col h-[calc(100vh-4rem)]">
+          /* Live Chat Room Layout */
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
             
             {firestoreError && (
-              <div className="max-w-4xl mx-auto w-full px-4 pt-3">
-                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
+              <div className="shrink-0 max-w-4xl mx-auto w-full px-3 pt-2">
+                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
                   <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
                   <span>{firestoreError}</span>
                 </div>
@@ -286,20 +418,26 @@ export default function App() {
             {messagesLoading ? (
               <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
                 <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                <span className="text-xs">Loading live conversation from online database...</span>
+                <span className="text-xs">Loading live conversation...</span>
               </div>
             ) : (
               <MessageList
                 messages={filteredMessages}
                 currentUser={currentUser}
                 searchQuery={searchQuery}
+                scrollTrigger={scrollTrigger}
               />
             )}
 
-            {/* Message input bar */}
+            {/* Real-time Typing Indicator (placed right above composer) */}
+            <TypingIndicator typingUsers={typingUsers} />
+
+            {/* Message input bar (shrink-0 fixed at bottom) */}
             <MessageComposer
               currentUser={currentUser}
               onSendMessage={handleSendMessage}
+              onFocusInput={() => setScrollTrigger((prev) => prev + 1)}
+              onTyping={handleTyping}
             />
           </div>
         )}
