@@ -34,6 +34,7 @@ export interface TypingUser {
   displayName: string;
   isTyping: boolean;
   timestamp: number;
+  text?: string;
 }
 
 export interface RoomMember {

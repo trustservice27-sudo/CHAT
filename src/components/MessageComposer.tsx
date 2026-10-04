@@ -6,7 +6,7 @@ interface MessageComposerProps {
   currentUser: ChatUser | null;
   onSendMessage: (text: string) => Promise<void> | void;
   onFocusInput?: () => void;
-  onTyping?: (isTyping: boolean) => void;
+  onTyping?: (isTyping: boolean, text?: string) => void;
 }
 
 export const MessageComposer: React.FC<MessageComposerProps> = ({
@@ -26,7 +26,7 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
       }
-      onTyping?.(false);
+      onTyping?.(false, '');
     };
   }, [onTyping]);
 
@@ -43,20 +43,20 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({
     if (!currentUser) return;
 
     if (newText.trim().length > 0) {
-      onTyping?.(true);
+      onTyping?.(true, newText);
 
       // Debounce: reset typing status after 2.5 seconds of inactivity
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
       }
       typingTimeoutRef.current = setTimeout(() => {
-        onTyping?.(false);
+        onTyping?.(false, '');
       }, 2500);
     } else {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
       }
-      onTyping?.(false);
+      onTyping?.(false, '');
     }
   }, [currentUser, onTyping]);
 

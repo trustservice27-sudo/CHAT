@@ -30,6 +30,29 @@ const isProduction = process.env.NODE_ENV === 'production' || (hasDist && proces
 
 let lastClearTimestamp = Date.now();
 
+// In-memory active typers map with real live typing text preview
+interface ActiveTyper {
+  userId: string;
+  displayName: string;
+  isTyping: boolean;
+  timestamp: number;
+  text?: string;
+}
+const activeTypers = new Map<string, ActiveTyper>();
+
+function getActiveTypersList(): ActiveTyper[] {
+  const now = Date.now();
+  const list: ActiveTyper[] = [];
+  for (const [uid, typer] of activeTypers.entries()) {
+    if (typer.isTyping && now - typer.timestamp < 6000) {
+      list.push(typer);
+    } else {
+      activeTypers.delete(uid);
+    }
+  }
+  return list;
+}
+
 // CORS & JSON body parser
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -68,11 +91,10 @@ app.get('/api/events', async (req, res) => {
   res.flushHeaders?.();
 
   try {
-    const [initialMessages, onlineList, allUsersList, typersList] = await Promise.all([
+    const [initialMessages, onlineList, allUsersList] = await Promise.all([
       getDbMessages(),
       getDbOnlineUsers(),
       getAllDbUsers(),
-      getDbTypers(),
     ]);
 
     const initData = {
@@ -80,7 +102,7 @@ app.get('/api/events', async (req, res) => {
       messages: initialMessages,
       onlineUsers: onlineList,
       allUsers: allUsersList,
-      typingUsers: typersList,
+      typingUsers: getActiveTypersList(),
       lastClearTimestamp,
     };
     res.write(`data: ${JSON.stringify(initData)}\n\n`);
@@ -151,7 +173,8 @@ app.post('/api/messages', async (req, res) => {
 
     // Update presence
     upsertDbPresence(userId, displayName || 'Anonymous').catch(() => {});
-    // Clear typing in online database
+    // Clear typing in online database and memory
+    activeTypers.delete(userId);
     upsertDbTyping(userId, displayName || 'Anonymous', false).catch(() => {});
 
     // Broadcast immediately in real-time
@@ -195,13 +218,25 @@ app.post('/api/presence', async (req, res) => {
   res.json({ success: true, onlineUsers: fallbackList, allUsers: allFallback });
 });
 
-// API: Typing status directly in online cloud storage
+// API: Typing status directly with live typing message text
 app.post('/api/typing', async (req, res) => {
-  const { userId, displayName, isTyping } = req.body || {};
+  const { userId, displayName, isTyping, text } = req.body || {};
   if (userId) {
     try {
-      await upsertDbTyping(userId, displayName || 'Member', Boolean(isTyping));
-      const typersList = await getDbTypers();
+      if (isTyping) {
+        activeTypers.set(userId, {
+          userId,
+          displayName: displayName || 'Member',
+          isTyping: true,
+          timestamp: Date.now(),
+          text: (text || '').slice(0, 120),
+        });
+      } else {
+        activeTypers.delete(userId);
+      }
+
+      upsertDbTyping(userId, displayName || 'Member', Boolean(isTyping)).catch(() => {});
+      const typersList = getActiveTypersList();
 
       broadcastSSE({
         type: 'typing',
@@ -211,20 +246,19 @@ app.post('/api/typing', async (req, res) => {
       res.json({ success: true, typingUsers: typersList });
       return;
     } catch (err) {
-      console.error('Error updating typing in online database:', err);
+      console.error('Error updating typing:', err);
     }
   }
-  const fallbackTypers = await getDbTypers().catch(() => []);
+  const fallbackTypers = getActiveTypersList();
   res.json({ success: true, typingUsers: fallbackTypers });
 });
 
 // API: High-frequency polling endpoint directly querying online cloud database
 app.get('/api/online-status', async (req, res) => {
   try {
-    const [onlineUsers, allUsers, typingUsers, currentMessages] = await Promise.all([
+    const [onlineUsers, allUsers, currentMessages] = await Promise.all([
       getDbOnlineUsers(),
       getAllDbUsers(),
-      getDbTypers(),
       getDbMessages(),
     ]);
 
@@ -232,7 +266,7 @@ app.get('/api/online-status', async (req, res) => {
       success: true,
       onlineUsers,
       allUsers,
-      typingUsers,
+      typingUsers: getActiveTypersList(),
       messageCount: currentMessages.length,
       lastClearTimestamp,
       lastMessageId: currentMessages.length > 0 ? currentMessages[currentMessages.length - 1].id : null,
@@ -242,23 +276,9 @@ app.get('/api/online-status', async (req, res) => {
   }
 });
 
-// API: Clear chat directly in online cloud storage
+// API: Clear chat directly in online cloud storage for EVERY user
 app.post('/api/clear-chat', async (req, res) => {
   try {
-    const enteredPassword = (req.body?.password || '').trim();
-    const envPassword = (process.env.CLEAR_PASSWORD || 'ADMIN').trim().toUpperCase();
-
-    // Accept ADMIN, admin, 1234, password, or custom env password
-    const validPasswords = new Set(['ADMIN', '1234', 'PASSWORD', envPassword]);
-
-    if (!enteredPassword || !validPasswords.has(enteredPassword.toUpperCase())) {
-      res.status(401).json({ 
-        success: false, 
-        error: 'Incorrect passcode. Access denied.' 
-      });
-      return;
-    }
-
     lastClearTimestamp = Date.now();
 
     // Clear online cloud storage directly
