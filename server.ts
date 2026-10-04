@@ -27,7 +27,7 @@ const distPath = path.resolve(__dirname, 'dist');
 const hasDist = fs.existsSync(path.resolve(distPath, 'index.html'));
 const isProduction = process.env.NODE_ENV === 'production' || (hasDist && process.env.NODE_ENV !== 'development');
 
-// Resilient Fallback Storage (Ensures messages work seamlessly even across container boundary or network fluctuations)
+// Resilient Fallback Storage
 const dataDir = path.resolve(__dirname, 'database_store');
 if (!fs.existsSync(dataDir)) {
   try {
@@ -47,6 +47,7 @@ interface StoredMessage {
 }
 
 let cachedMessages: StoredMessage[] = [];
+let lastClearTimestamp = Date.now();
 
 try {
   if (fs.existsSync(primaryBackup)) {
@@ -153,7 +154,7 @@ app.get('/api/events', async (req, res) => {
       persistBackupStore();
     }
   } catch (err) {
-    console.warn('Initial load using fallback cache:', err);
+    console.warn('Initial load note:', err);
   }
 
   const onlineList = getActiveOnlineUsers();
@@ -164,6 +165,7 @@ app.get('/api/events', async (req, res) => {
     messages: initialMessages,
     onlineUsers: onlineList,
     typingUsers: typersList,
+    lastClearTimestamp,
   };
   res.write(`data: ${JSON.stringify(initData)}\n\n`);
 
@@ -198,9 +200,9 @@ app.get('/api/messages', async (req, res) => {
     } catch (e) {
       console.warn('Reading from resilient cache:', e);
     }
-    res.json({ success: true, messages: list });
+    res.json({ success: true, messages: list, lastClearTimestamp });
   } catch (err: any) {
-    res.json({ success: true, messages: cachedMessages });
+    res.json({ success: true, messages: cachedMessages, lastClearTimestamp });
   }
 });
 
@@ -234,7 +236,6 @@ app.post('/api/messages', async (req, res) => {
     insertDbMessage(userId, displayName || 'Anonymous', trimmed, photoURL)
       .then((sqlSaved) => {
         if (sqlSaved) {
-          // Update id if needed
           const idx = cachedMessages.findIndex((m) => m.id === newMessage.id);
           if (idx !== -1) {
             cachedMessages[idx].id = sqlSaved.id;
@@ -313,13 +314,14 @@ app.post('/api/typing', async (req, res) => {
   res.json({ success: true, typingUsers: getActiveTypers() });
 });
 
-// API: Mobile status poll (Every phone polls this every 2 seconds for guaranteed multi-phone live sync)
+// API: Mobile status poll (Every phone polls this every 1.5-2 seconds for guaranteed multi-phone live sync)
 app.get('/api/online-status', (req, res) => {
   res.json({
     success: true,
     onlineUsers: getActiveOnlineUsers(),
     typingUsers: getActiveTypers(),
     messageCount: cachedMessages.length,
+    lastClearTimestamp,
     lastMessageId: cachedMessages.length > 0 ? cachedMessages[cachedMessages.length - 1].id : null,
   });
 });
@@ -341,11 +343,14 @@ app.post('/api/clear-chat', async (req, res) => {
       return;
     }
 
-    // 1. Wipe resilient cache
+    // 1. Update clear timestamp
+    lastClearTimestamp = Date.now();
+
+    // 2. Wipe resilient cache
     cachedMessages = [];
     persistBackupStore();
 
-    // 2. Wipe active users/typing if everything requested
+    // 3. Wipe active users/typing if everything requested
     if (req.body?.mode === 'everything_and_new_user') {
       activeUsersMap.clear();
       activeTypersMap.clear();
@@ -354,14 +359,16 @@ app.post('/api/clear-chat', async (req, res) => {
       clearDbMessages().catch(() => {});
     }
 
-    // 3. Broadcast clear event to all screens worldwide
+    // 4. Broadcast clear event to all screens worldwide with timestamp
     broadcastSSE({
       type: 'clear',
+      lastClearTimestamp,
     });
 
     res.status(200).json({ 
       success: true, 
       authorized: true, 
+      lastClearTimestamp,
       message: 'Chat history cleared successfully.' 
     });
   } catch (err: any) {

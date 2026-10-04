@@ -15,31 +15,34 @@ import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
 import { Loader2 } from 'lucide-react';
 
-function mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-  const map = new Map<string, ChatMessage>();
+// Authoritative synchronization with server state:
+// 1. If server is empty/cleared -> immediately empty!
+// 2. Never restore messages that were deleted on the server.
+// 3. Only keep pending unconfirmed messages sent in the last 4 seconds.
+function syncServerMessages(existing: ChatMessage[], serverMsgs: ChatMessage[]): ChatMessage[] {
+  if (!serverMsgs || serverMsgs.length === 0) {
+    return [];
+  }
 
-  existing.forEach((m) => map.set(m.id, m));
+  const nowSec = Math.floor(Date.now() / 1000);
+  const pendingOptimistic = existing.filter(
+    (m) => m.id.startsWith('temp_') && (nowSec - (m.createdAt?.seconds || 0) < 4)
+  );
 
-  incoming.forEach((newMsg) => {
-    // If a temporary optimistic message exists with matching user and text, replace it
-    let matchedTempId: string | null = null;
-    for (const [id, ex] of map.entries()) {
-      if (
-        id.startsWith('temp_') &&
-        ex.userId === newMsg.userId &&
-        ex.text === newMsg.text
-      ) {
-        matchedTempId = id;
-        break;
-      }
+  const serverMap = new Map<string, ChatMessage>();
+  serverMsgs.forEach((m) => serverMap.set(m.id, m));
+
+  // Retain pending optimistic messages only if not already confirmed by server
+  pendingOptimistic.forEach((opt) => {
+    const alreadyOnServer = serverMsgs.some(
+      (s) => s.userId === opt.userId && s.text === opt.text
+    );
+    if (!alreadyOnServer) {
+      serverMap.set(opt.id, opt);
     }
-    if (matchedTempId) {
-      map.delete(matchedTempId);
-    }
-    map.set(newMsg.id, newMsg);
   });
 
-  return Array.from(map.values()).sort((a, b) => {
+  return Array.from(serverMap.values()).sort((a, b) => {
     const tA = (a.createdAt?.seconds || 0) * 1000 + (a.createdAt?.nanoseconds || 0) / 1000000;
     const tB = (b.createdAt?.seconds || 0) * 1000 + (b.createdAt?.nanoseconds || 0) / 1000000;
     return tA - tB;
@@ -68,13 +71,15 @@ export default function App() {
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
 
-  // Keep persistent client cache in sync so refresh on any mobile or laptop never loses history
+  // Synchronize local cache with current message state
   useEffect(() => {
-    if (messages.length > 0) {
-      try {
+    try {
+      if (messages.length === 0) {
+        localStorage.removeItem('openchat_messages_cache');
+      } else {
         localStorage.setItem('openchat_messages_cache', JSON.stringify(messages.slice(-200)));
-      } catch {}
-    }
+      }
+    } catch {}
   }, [messages]);
 
   // UI state
@@ -84,19 +89,54 @@ export default function App() {
   const [infoModalOpen, setInfoModalOpen] = useState(false);
   const [scrollTrigger, setScrollTrigger] = useState(0);
 
-  // Audio trigger tracking
+  // Audio & Clear Tracking
   const initialLoadDone = useRef(false);
   const isTypingActiveRef = useRef(false);
   const lastKnownCountRef = useRef(messages.length);
+  const lastClearTsRef = useRef<number>(
+    (() => {
+      try {
+        return Number(localStorage.getItem('openchat_clear_ts') || '0');
+      } catch {
+        return 0;
+      }
+    })()
+  );
 
-  // Helper function to fetch messages
-  const refreshMessages = () => {
+  // Action to wipe messages across state and storage
+  const wipeAllMessagesLocal = (clearTs?: number) => {
+    setMessages([]);
+    lastKnownCountRef.current = 0;
+    if (clearTs) {
+      lastClearTsRef.current = clearTs;
+      try {
+        localStorage.setItem('openchat_clear_ts', String(clearTs));
+      } catch {}
+    }
+    try {
+      localStorage.removeItem('openchat_messages_cache');
+    } catch {}
+  };
+
+  // Helper to fetch authoritative message list from server
+  const fetchAuthoritativeMessages = () => {
     fetch('/api/messages')
       .then((res) => res.json())
       .then((data) => {
-        if (data.success && Array.isArray(data.messages)) {
-          setMessages((prev) => mergeMessages(prev, data.messages));
-          lastKnownCountRef.current = data.messages.length;
+        if (data.success) {
+          if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
+            wipeAllMessagesLocal(data.lastClearTimestamp);
+            return;
+          }
+
+          if (Array.isArray(data.messages)) {
+            if (data.messages.length === 0) {
+              wipeAllMessagesLocal();
+            } else {
+              setMessages((prev) => syncServerMessages(prev, data.messages));
+              lastKnownCountRef.current = data.messages.length;
+            }
+          }
           setMessagesLoading(false);
           initialLoadDone.current = true;
         }
@@ -104,9 +144,9 @@ export default function App() {
       .catch((err) => console.warn('Message fetch note:', err));
   };
 
-  // 1. Initial Load and Real-Time SSE Stream
+  // 1. Initial Load & Real-Time SSE Stream
   useEffect(() => {
-    refreshMessages();
+    fetchAuthoritativeMessages();
 
     let eventSource: EventSource | null = null;
 
@@ -118,11 +158,15 @@ export default function App() {
           const data = JSON.parse(event.data);
 
           if (data.type === 'init') {
-            if (Array.isArray(data.messages)) {
-              setMessages((prev) => mergeMessages(prev, data.messages));
-              lastKnownCountRef.current = data.messages.length;
-              setMessagesLoading(false);
-              initialLoadDone.current = true;
+            if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
+              wipeAllMessagesLocal(data.lastClearTimestamp);
+            } else if (Array.isArray(data.messages)) {
+              if (data.messages.length === 0) {
+                wipeAllMessagesLocal();
+              } else {
+                setMessages((prev) => syncServerMessages(prev, data.messages));
+                lastKnownCountRef.current = data.messages.length;
+              }
             }
             if (Array.isArray(data.onlineUsers)) {
               setOnlineUsers(data.onlineUsers);
@@ -130,24 +174,34 @@ export default function App() {
             if (Array.isArray(data.typingUsers)) {
               setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
             }
+            setMessagesLoading(false);
+            initialLoadDone.current = true;
+
           } else if (data.type === 'new_message' && data.message) {
-            setMessages((prev) => mergeMessages(prev, [data.message]));
+            setMessages((prev) => {
+              // Add new message and avoid duplicate IDs
+              if (prev.some((m) => m.id === data.message.id)) return prev;
+              const filtered = prev.filter(
+                (m) => !(m.id.startsWith('temp_') && m.userId === data.message.userId && m.text === data.message.text)
+              );
+              return [...filtered, data.message];
+            });
             lastKnownCountRef.current += 1;
             setMessagesLoading(false);
 
             if (currentUser && data.message.userId !== currentUser.uid && soundEnabled) {
               playNotificationSound();
             }
+
           } else if (data.type === 'presence' && Array.isArray(data.onlineUsers)) {
             setOnlineUsers(data.onlineUsers);
+
           } else if (data.type === 'typing' && Array.isArray(data.typingUsers)) {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
+
           } else if (data.type === 'clear') {
-            setMessages([]);
-            lastKnownCountRef.current = 0;
-            try {
-              localStorage.removeItem('openchat_messages_cache');
-            } catch {}
+            // Immediate real-time clear received from another user!
+            wipeAllMessagesLocal(data.lastClearTimestamp || Date.now());
           }
         } catch (err) {
           console.warn('Error reading event stream:', err);
@@ -168,14 +222,25 @@ export default function App() {
     };
   }, [currentUser, soundEnabled]);
 
-  // 2. High-Frequency Mobile Fallback Polling (Every 2 seconds)
-  // Ensures all users see each other's messages, typing, and presence across all phones and laptops
+  // 2. High-Frequency Fallback Polling (Every 1.5 seconds)
+  // Guarantees all phones and laptops see changes, clears, presence, and messages in real-time
   useEffect(() => {
-    const pollMobileStatus = async () => {
+    const pollStatus = async () => {
       try {
         const res = await fetch('/api/online-status');
         const data = await res.json();
         if (data.success) {
+          // Check if another user cleared the chat room!
+          if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
+            wipeAllMessagesLocal(data.lastClearTimestamp);
+            return;
+          }
+
+          if (data.messageCount === 0 && messages.length > 0) {
+            wipeAllMessagesLocal();
+            return;
+          }
+
           if (Array.isArray(data.onlineUsers)) {
             setOnlineUsers(data.onlineUsers);
           }
@@ -183,17 +248,17 @@ export default function App() {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
           }
 
-          // If message count on server differs from what we have, sync immediately
+          // If server message count changed, pull updates immediately
           if (typeof data.messageCount === 'number' && data.messageCount !== lastKnownCountRef.current) {
-            refreshMessages();
+            fetchAuthoritativeMessages();
           }
         }
       } catch {}
     };
 
-    const interval = setInterval(pollMobileStatus, 2000);
+    const interval = setInterval(pollStatus, 1500);
     return () => clearInterval(interval);
-  }, [currentUser]);
+  }, [currentUser, messages.length]);
 
   // 3. Online Presence Heartbeat
   useEffect(() => {
@@ -218,7 +283,7 @@ export default function App() {
     };
 
     pingOnlinePresence();
-    const interval = setInterval(pingOnlinePresence, 12000);
+    const interval = setInterval(pingOnlinePresence, 10000);
     return () => clearInterval(interval);
   }, [currentUser]);
 
@@ -228,9 +293,7 @@ export default function App() {
     try {
       localStorage.setItem('openchat_user', JSON.stringify(user));
       localStorage.setItem('openchat_uid', user.uid);
-    } catch {
-      // Ignore
-    }
+    } catch {}
 
     fetch('/api/presence', {
       method: 'POST',
@@ -267,9 +330,7 @@ export default function App() {
     try {
       localStorage.removeItem('openchat_user');
       localStorage.removeItem('openchat_uid');
-    } catch {
-      // Ignore
-    }
+    } catch {}
   };
 
   // Broadcast typing status
@@ -332,7 +393,11 @@ export default function App() {
       });
       const data = await res.json();
       if (data?.message) {
-        setMessages((prev) => mergeMessages(prev, [data.message]));
+        setMessages((prev) => {
+          const withoutTemp = prev.filter((m) => m.id !== tempId);
+          if (withoutTemp.some((m) => m.id === data.message.id)) return withoutTemp;
+          return [...withoutTemp, data.message];
+        });
       }
     } catch (err) {
       console.warn('Message send note:', err);
@@ -353,13 +418,11 @@ export default function App() {
 
   // Reset Everything handler
   const handleResetEverything = () => {
-    setMessages([]);
+    wipeAllMessagesLocal(Date.now());
     setOnlineUsers([]);
     setTypingUsers([]);
     setCurrentUser(null);
-    lastKnownCountRef.current = 0;
     try {
-      localStorage.removeItem('openchat_messages_cache');
       localStorage.removeItem('openchat_user');
       localStorage.removeItem('openchat_uid');
     } catch {}
@@ -467,11 +530,7 @@ export default function App() {
         onClose={() => setClearModalOpen(false)}
         currentUser={currentUser}
         onCleared={() => {
-          setMessages([]);
-          lastKnownCountRef.current = 0;
-          try {
-            localStorage.removeItem('openchat_messages_cache');
-          } catch {}
+          wipeAllMessagesLocal(Date.now());
         }}
         onResetAll={handleResetEverything}
       />
