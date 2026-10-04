@@ -4,20 +4,6 @@
  */
 
 import React, { useEffect, useState, useRef } from 'react';
-import { 
-  db, 
-  collection, 
-  query, 
-  orderBy, 
-  limit, 
-  onSnapshot, 
-  addDoc, 
-  setDoc,
-  doc,
-  serverTimestamp, 
-  handleFirestoreError, 
-  OperationType
-} from './firebase';
 import type { ChatMessage, ChatUser, OnlineUser, TypingUser } from './types';
 import { Header } from './components/Header';
 import { MessageList } from './components/MessageList';
@@ -27,7 +13,7 @@ import { AuthModal } from './components/AuthModal';
 import { ClearModal } from './components/ClearModal';
 import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
-import { Loader2, Sparkles, Database } from 'lucide-react';
+import { Loader2, Database } from 'lucide-react';
 
 function mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   const map = new Map<string, ChatMessage>();
@@ -100,13 +86,11 @@ export default function App() {
 
   // Audio trigger tracking
   const initialLoadDone = useRef(false);
-  const prevMessagesCount = useRef(0);
   const isTypingActiveRef = useRef(false);
 
-  // 1. Central Online Database Real-Time Stream (SSE) & Direct History Fetch
-  // Ensures all previous chats immediately load for ANY user from ANYWHERE in the world
+  // 1. Google Cloud SQL Real-Time Stream (SSE) & Direct History Fetch
   useEffect(() => {
-    // Immediate HTTP fetch of previous chat history from the online database
+    // Immediate HTTP fetch of previous chat history from Google Cloud SQL database
     fetch('/api/messages')
       .then((res) => res.json())
       .then((data) => {
@@ -116,7 +100,7 @@ export default function App() {
           initialLoadDone.current = true;
         }
       })
-      .catch((err) => console.warn('Online database history fetch error:', err));
+      .catch((err) => console.warn('Cloud SQL history fetch note:', err));
 
     let eventSource: EventSource | null = null;
 
@@ -152,9 +136,12 @@ export default function App() {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
           } else if (data.type === 'clear') {
             setMessages([]);
+            try {
+              localStorage.removeItem('openchat_messages_cache');
+            } catch {}
           }
         } catch (err) {
-          console.warn('Error reading online database stream:', err);
+          console.warn('Error reading Cloud SQL event stream:', err);
         }
       };
 
@@ -162,7 +149,7 @@ export default function App() {
         // Automatically reconnects
       };
     } catch (e) {
-      console.warn('Online database stream init:', e);
+      console.warn('Cloud SQL stream init:', e);
     }
 
     return () => {
@@ -172,61 +159,7 @@ export default function App() {
     };
   }, [currentUser, soundEnabled]);
 
-  // 2. Parallel Cloud Firestore Listener (with graceful quota resilience)
-  useEffect(() => {
-    const path = 'messages';
-    const messagesQuery = query(
-      collection(db, path),
-      orderBy('createdAt', 'asc'),
-      limit(50)
-    );
-
-    const unsubscribe = onSnapshot(
-      messagesQuery,
-      (snapshot) => {
-        const loaded: ChatMessage[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          return {
-            id: docSnap.id,
-            userId: data.userId || '',
-            displayName: data.displayName || 'Member',
-            photoURL: data.photoURL,
-            text: data.text || '',
-            createdAt: data.createdAt || null,
-            readBy: Array.isArray(data.readBy) ? data.readBy : [],
-            seenBy: Array.isArray(data.seenBy) ? data.seenBy : [],
-          };
-        });
-
-        if (
-          initialLoadDone.current &&
-          loaded.length > prevMessagesCount.current &&
-          soundEnabled
-        ) {
-          const latest = loaded[loaded.length - 1];
-          if (latest && currentUser && latest.userId !== currentUser.uid) {
-            playNotificationSound();
-          }
-        }
-
-        prevMessagesCount.current = loaded.length;
-        initialLoadDone.current = true;
-        setMessages((prev) => mergeMessages(prev, loaded));
-        setMessagesLoading(false);
-      },
-      (error) => {
-        setMessagesLoading(false);
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (!errMsg.toLowerCase().includes('quota') && !errMsg.toLowerCase().includes('resource-exhausted')) {
-          handleFirestoreError(error, OperationType.GET, path);
-        }
-      }
-    );
-
-    return () => unsubscribe();
-  }, [currentUser, soundEnabled]);
-
-  // 3. Online Presence Heartbeat to Online Database
+  // 2. Online Presence Heartbeat to Google Cloud SQL
   useEffect(() => {
     if (!currentUser) return;
 
@@ -239,13 +172,6 @@ export default function App() {
           displayName: currentUser.displayName,
         }),
       }).catch(() => {});
-
-      // Background Firestore ping
-      setDoc(doc(db, 'users', currentUser.uid), {
-        userId: currentUser.uid,
-        displayName: currentUser.displayName,
-        lastActive: serverTimestamp(),
-      }, { merge: true }).catch(() => {});
     };
 
     pingOnlinePresence();
@@ -271,12 +197,6 @@ export default function App() {
         displayName: user.displayName,
       }),
     }).catch(() => {});
-
-    setDoc(doc(db, 'users', user.uid), {
-      userId: user.uid,
-      displayName: user.displayName,
-      lastActive: serverTimestamp(),
-    }, { merge: true }).catch(() => {});
   };
 
   // Leave room handler
@@ -291,13 +211,6 @@ export default function App() {
           isTyping: false,
         }),
       }).catch(() => {});
-
-      setDoc(doc(db, 'typing', currentUser.uid), {
-        userId: currentUser.uid,
-        displayName: currentUser.displayName,
-        isTyping: false,
-        timestamp: Date.now(),
-      }, { merge: true }).catch(() => {});
     }
 
     setCurrentUser(null);
@@ -309,7 +222,7 @@ export default function App() {
     }
   };
 
-  // Broadcast typing status
+  // Broadcast typing status to Google Cloud SQL
   const handleTyping = (isTyping: boolean) => {
     if (!currentUser || isTypingActiveRef.current === isTyping) return;
     isTypingActiveRef.current = isTyping;
@@ -323,16 +236,9 @@ export default function App() {
         isTyping,
       }),
     }).catch(() => {});
-
-    setDoc(doc(db, 'typing', currentUser.uid), {
-      userId: currentUser.uid,
-      displayName: currentUser.displayName,
-      isTyping,
-      timestamp: Date.now(),
-    }, { merge: true }).catch(() => {});
   };
 
-  // Send message directly to Online Database
+  // Send message directly to Google Cloud SQL Database
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
 
@@ -354,7 +260,7 @@ export default function App() {
 
     setMessages((prev) => [...prev, optimisticMessage]);
 
-    // 1. Save to Central Online Database (Broadcasting live to all other users)
+    // 1. Save to Google Cloud SQL Database (Broadcasting live to all other users)
     try {
       await fetch('/api/messages', {
         method: 'POST',
@@ -367,7 +273,7 @@ export default function App() {
         }),
       });
     } catch (err) {
-      console.warn('Online database message save note:', err);
+      console.warn('Cloud SQL message save note:', err);
     }
 
     // 2. Clear typing status
@@ -381,30 +287,6 @@ export default function App() {
         isTyping: false,
       }),
     }).catch(() => {});
-
-    // 3. Background sync to Firestore Cloud
-    const path = 'messages';
-    const payload = {
-      userId: currentUser.uid,
-      displayName: currentUser.displayName,
-      text: trimmed,
-      createdAt: serverTimestamp(),
-      readBy: [currentUser.uid],
-      seenBy: [{
-        userId: currentUser.uid,
-        displayName: currentUser.displayName,
-        seenAt: Date.now(),
-      }],
-    };
-
-    addDoc(collection(db, path), payload).catch(() => {});
-
-    setDoc(doc(db, 'typing', currentUser.uid), {
-      userId: currentUser.uid,
-      displayName: currentUser.displayName,
-      isTyping: false,
-      timestamp: Date.now(),
-    }, { merge: true }).catch(() => {});
   };
 
   // Reset Everything handler
@@ -458,7 +340,7 @@ export default function App() {
               {onlineUsers.slice(0, 8).map((u) => (
                 <div 
                   key={u.userId}
-                  title={`${u.displayName} (Online Database)`}
+                  title={`${u.displayName} (Online)`}
                   className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-indigo-600/80 border border-slate-700 text-white font-bold text-[9px] sm:text-[10px] flex items-center justify-center ring-1 ring-slate-900"
                 >
                   {(u.displayName || 'M')[0].toUpperCase()}
@@ -471,9 +353,9 @@ export default function App() {
               </span>
             )}
           </div>
-          <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline-flex items-center gap-1.5 shrink-0">
-            <Database className="w-3.5 h-3.5 text-emerald-400" />
-            Online Cloud Sync
+          <span className="text-[10px] text-emerald-400 font-medium hidden sm:inline-flex items-center gap-1.5 shrink-0">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            Live Synced
           </span>
         </div>
       )}
@@ -491,7 +373,7 @@ export default function App() {
             {messagesLoading && messages.length === 0 ? (
               <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
                 <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                <span className="text-xs">Connecting to online database...</span>
+                <span className="text-xs">Connecting to chat room...</span>
               </div>
             ) : (
               <MessageList

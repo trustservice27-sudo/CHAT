@@ -3,8 +3,6 @@ import {
   X, 
   ShieldCheck, 
   Lock, 
-  CheckCircle2, 
-  Flame, 
   Terminal, 
   Users, 
   Server,
@@ -36,7 +34,7 @@ export const InfoModal: React.FC<InfoModalProps> = ({ isOpen, onClose }) => {
                 OpenChat Architecture & Security
               </h3>
               <p className="text-xs text-slate-400">
-                Real-time Firestore public group chat with verified access
+                Real-time synchronized public group chat with protected admin access
               </p>
             </div>
           </div>
@@ -70,7 +68,7 @@ export const InfoModal: React.FC<InfoModalProps> = ({ isOpen, onClose }) => {
                 No Client Deletions
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Security rules forbid browser clients from editing or deleting messages directly, ensuring chat integrity.
+                Clients cannot edit or delete messages directly, ensuring chat integrity.
               </p>
             </div>
 
@@ -80,25 +78,22 @@ export const InfoModal: React.FC<InfoModalProps> = ({ isOpen, onClose }) => {
                 Server CLEAR Secret
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                The CLEAR action requires a password validated strictly on the server side, protecting against malicious wipes.
+                The CLEAR action requires a password validated strictly on the server side, protecting against unauthorized wipes.
               </p>
             </div>
           </div>
 
-          {/* Firestore Rules Blueprint */}
+          {/* Real-time Architecture */}
           <div>
             <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2 flex items-center gap-2">
               <FileCode2 className="w-4 h-4 text-indigo-400" />
-              Active Firestore Security Rules
+              Real-Time Synchronization
             </h4>
             <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 font-mono text-xs text-slate-300 leading-relaxed overflow-x-auto">
-              <pre>{`match /messages/{messageId} {
-  allow read: if isSignedIn();
-  allow create: if isSignedIn()
-    && isValidId(messageId)
-    && isValidMessage(request.resource.data);
-  allow update, delete: if false;
-}`}</pre>
+              <pre>{`// High-performance live event streaming
+1. Instant optimistic local rendering
+2. Real-time broadcast to all connected devices worldwide
+3. Live presence heartbeat and active typing indicators`}</pre>
             </div>
           </div>
 
@@ -106,12 +101,12 @@ export const InfoModal: React.FC<InfoModalProps> = ({ isOpen, onClose }) => {
           <div>
             <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2 flex items-center gap-2">
               <Terminal className="w-4 h-4 text-cyan-400" />
-              Cloud Secret Configuration
+              Server Secret Configuration
             </h4>
             <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 font-mono text-xs text-slate-300 space-y-1.5">
-              <p className="text-slate-400"># To set the server-side CLEAR secret in Firebase Functions:</p>
-              <p className="text-cyan-300">firebase functions:secrets:set CLEAR_PASSWORD</p>
-              <p className="text-slate-400"># Or set CLEAR_PASSWORD in your environment variables</p>
+              <p className="text-slate-400"># Passcode for the Clear action:</p>
+              <p className="text-cyan-300">ADMIN</p>
+              <p className="text-slate-400"># Or customize CLEAR_PASSWORD in your environment variables</p>
             </div>
           </div>
 

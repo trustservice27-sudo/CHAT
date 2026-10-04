@@ -2,40 +2,35 @@ import React, { useState } from 'react';
 import { 
   X, 
   Trash2, 
+  AlertTriangle, 
+  CheckCircle2, 
   KeyRound, 
   Eye, 
   EyeOff, 
-  AlertTriangle, 
-  CheckCircle2, 
-  Loader2, 
-  ShieldAlert,
   Server,
-  UserX,
   MessageSquareX,
-  RotateCcw
+  UserX
 } from 'lucide-react';
-import { db, collection, getDocs, writeBatch } from '../firebase';
 import type { ChatUser } from '../types';
 
 interface ClearModalProps {
   isOpen: boolean;
   onClose: () => void;
-  currentUser?: ChatUser | null;
+  currentUser: ChatUser | null;
   onCleared: () => void;
   onResetAll?: () => void;
 }
 
-type ClearMode = 'messages_only' | 'everything_and_new_user';
-
 export const ClearModal: React.FC<ClearModalProps> = ({
   isOpen,
   onClose,
+  currentUser,
   onCleared,
   onResetAll,
 }) => {
-  const [mode, setMode] = useState<ClearMode>('everything_and_new_user');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [mode, setMode] = useState<'messages_only' | 'everything_and_new_user'>('messages_only');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
@@ -54,11 +49,11 @@ export const ClearModal: React.FC<ClearModalProps> = ({
     setError(null);
 
     try {
-      // 1. Clear Central Online Database via server API
+      // Clear Google Cloud SQL Database via server API
       const res = await fetch('/api/clear-chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: entered })
+        body: JSON.stringify({ password: entered, mode }),
       });
       
       const data = await res.json().catch(() => ({}));
@@ -66,151 +61,91 @@ export const ClearModal: React.FC<ClearModalProps> = ({
         throw new Error(data?.error || 'Incorrect passcode. Access denied.');
       }
 
-      // 2. Also clear Firestore Cloud collections in background (with safe error handling for quota limits)
-      try {
-        const messagesSnap = await getDocs(collection(db, 'messages'));
-        if (!messagesSnap.empty) {
-          const batch = writeBatch(db);
-          messagesSnap.docs.forEach((docSnap) => {
-            batch.delete(docSnap.ref);
-          });
-          await batch.commit();
-        }
-      } catch (fsErr) {
-        console.warn('Firestore online collection clear note:', fsErr);
-      }
-
-      // 3. If "Clear Everything & Start as New User" is selected:
+      // If "Clear Everything & Start as New User" is selected:
       if (mode === 'everything_and_new_user') {
-        try {
-          const usersSnap = await getDocs(collection(db, 'users'));
-          if (!usersSnap.empty) {
-            const userBatch = writeBatch(db);
-            usersSnap.docs.forEach((docSnap) => {
-              userBatch.delete(docSnap.ref);
-            });
-            await userBatch.commit();
-          }
-        } catch (fsErr) {
-          console.warn('Firestore users collection clear note:', fsErr);
-        }
-
-        try {
-          const typingSnap = await getDocs(collection(db, 'typing'));
-          if (!typingSnap.empty) {
-            const typingBatch = writeBatch(db);
-            typingSnap.docs.forEach((docSnap) => {
-              typingBatch.delete(docSnap.ref);
-            });
-            await typingBatch.commit();
-          }
-        } catch (fsErr) {
-          console.warn('Firestore typing collection clear note:', fsErr);
-        }
-
-        // Clear user session
         try {
           localStorage.removeItem('openchat_user');
           localStorage.removeItem('openchat_uid');
-        } catch {
-          // Ignore
+          localStorage.removeItem('openchat_messages_cache');
+        } catch {}
+
+        if (onResetAll) {
+          onResetAll();
         }
       }
 
       setSuccess(true);
       setTimeout(() => {
-        if (mode === 'everything_and_new_user') {
-          onResetAll?.();
-        } else {
-          onCleared();
-        }
-        onClose();
-        setPassword('');
-        setSuccess(false);
+        onCleared();
+        handleClose();
       }, 1000);
     } catch (err: any) {
-      setError(err.message || 'Incorrect security code or operation failed.');
+      setError(err.message || 'Verification failed. Please try again.');
     } finally {
       setLoading(false);
     }
   };
 
+  const handleClose = () => {
+    if (loading) return;
+    setPassword('');
+    setShowPassword(false);
+    setError(null);
+    setSuccess(false);
+    setMode('messages_only');
+    onClose();
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
       <div 
-        className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl p-5 sm:p-7 relative overflow-hidden"
+        className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-5 sm:p-6 relative overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Decorative glow */}
-        <div className="absolute -top-12 -right-12 w-32 h-32 bg-rose-500/10 rounded-full blur-2xl pointer-events-none"></div>
-
-        {/* Close Button */}
-        <button
-          onClick={onClose}
-          disabled={loading}
-          className="absolute top-4 right-4 text-slate-400 hover:text-slate-200 p-1.5 rounded-xl hover:bg-slate-800 transition-colors"
-          aria-label="Close"
-        >
-          <X className="w-5 h-5" />
-        </button>
-
         {/* Header */}
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-11 h-11 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center justify-center shrink-0">
-            <ShieldAlert className="w-6 h-6" />
+        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center justify-center shrink-0">
+              <Trash2 className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-slate-100 flex items-center gap-1.5">
+                Clear Database
+                <span className="text-[10px] font-mono font-normal px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20">
+                  Protected
+                </span>
+              </h3>
+              <p className="text-xs text-slate-400 flex items-center gap-1">
+                <Server className="w-3 h-3 text-indigo-400" />
+                Server Database
+              </p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-lg font-bold text-slate-100">
-              Clear & Reset Options
-            </h3>
-            <span className="text-xs text-rose-400 font-medium flex items-center gap-1">
-              <Server className="w-3 h-3" /> Security Protected
-            </span>
-          </div>
+          <button
+            onClick={handleClose}
+            className="text-slate-400 hover:text-slate-200 p-1 rounded-lg transition-colors"
+            disabled={loading}
+            aria-label="Close"
+          >
+            <X className="w-5 h-5" />
+          </button>
         </div>
 
         {/* Mode Selector */}
-        <div className="grid grid-cols-1 gap-2 mb-4">
+        <div className="my-4 space-y-2">
           <label 
-            onClick={() => setMode('everything_and_new_user')}
-            className={`p-3 rounded-2xl border cursor-pointer transition-all flex items-start gap-3 ${
-              mode === 'everything_and_new_user'
-                ? 'bg-rose-500/15 border-rose-500/50 text-white shadow-md shadow-rose-950/30'
-                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:border-slate-700'
+            className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
+              mode === 'messages_only' 
+                ? 'bg-slate-800/80 border-indigo-500/50 ring-1 ring-indigo-500/50' 
+                : 'bg-slate-950/40 border-slate-800 hover:bg-slate-800/40'
             }`}
           >
-            <input 
-              type="radio" 
-              name="clear_mode" 
-              checked={mode === 'everything_and_new_user'} 
-              onChange={() => setMode('everything_and_new_user')}
-              className="mt-1 accent-rose-500"
-            />
-            <div className="flex-1">
-              <div className="text-sm font-semibold flex items-center gap-1.5 text-slate-100">
-                <RotateCcw className="w-4 h-4 text-rose-400" />
-                Clear Everything & Make a New User
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
-                Wipes all messages, resets users and online sessions, and resets your profile to join fresh as a new user.
-              </p>
-            </div>
-          </label>
-
-          <label 
-            onClick={() => setMode('messages_only')}
-            className={`p-3 rounded-2xl border cursor-pointer transition-all flex items-start gap-3 ${
-              mode === 'messages_only'
-                ? 'bg-rose-500/15 border-rose-500/50 text-white shadow-md shadow-rose-950/30'
-                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:border-slate-700'
-            }`}
-          >
-            <input 
-              type="radio" 
-              name="clear_mode" 
-              checked={mode === 'messages_only'} 
+            <input
+              type="radio"
+              name="clear_mode"
+              checked={mode === 'messages_only'}
               onChange={() => setMode('messages_only')}
-              className="mt-1 accent-rose-500"
+              className="mt-1 text-indigo-600 focus:ring-indigo-500"
             />
             <div className="flex-1">
               <div className="text-sm font-semibold flex items-center gap-1.5 text-slate-100">
@@ -218,7 +153,32 @@ export const ClearModal: React.FC<ClearModalProps> = ({
                 Clear Messages Only
               </div>
               <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
-                Deletes all chat messages, keeping your current name and active session.
+                Deletes all chat messages from the database, keeping your active session.
+              </p>
+            </div>
+          </label>
+
+          <label 
+            className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
+              mode === 'everything_and_new_user' 
+                ? 'bg-rose-950/20 border-rose-500/50 ring-1 ring-rose-500/50' 
+                : 'bg-slate-950/40 border-slate-800 hover:bg-slate-800/40'
+            }`}
+          >
+            <input
+              type="radio"
+              name="clear_mode"
+              checked={mode === 'everything_and_new_user'}
+              onChange={() => setMode('everything_and_new_user')}
+              className="mt-1 text-rose-600 focus:ring-rose-500"
+            />
+            <div className="flex-1">
+              <div className="text-sm font-semibold flex items-center gap-1.5 text-rose-300">
+                <UserX className="w-4 h-4 text-rose-400" />
+                Clear Everything & Start Fresh
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+                Wipes all messages, presence, and logs you out to choose a new name.
               </p>
             </div>
           </label>
@@ -264,46 +224,30 @@ export const ClearModal: React.FC<ClearModalProps> = ({
 
           {success && (
             <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2 animate-in fade-in">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>
-                {mode === 'everything_and_new_user'
-                  ? 'All data cleared! Resetting as a new user...'
-                  : 'All messages have been successfully cleared.'}
-              </span>
+              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              <span>Database cleared successfully!</span>
             </div>
           )}
 
-          <div className="flex items-center justify-end gap-3 pt-1">
+          <div className="flex items-center justify-end gap-2.5 pt-2">
             <button
               type="button"
-              onClick={onClose}
-              disabled={loading}
-              className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-xl transition-colors"
+              onClick={handleClose}
+              disabled={loading || success}
+              className="px-4 py-2 text-xs font-semibold text-slate-300 hover:text-slate-100 hover:bg-slate-800 rounded-xl transition-colors disabled:opacity-50"
             >
               Cancel
             </button>
             <button
               type="submit"
-              disabled={loading || success || !password.trim()}
-              className="flex items-center gap-2 px-5 py-2 text-sm font-semibold text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-50 disabled:pointer-events-none rounded-xl shadow-lg shadow-rose-900/30 transition-all active:scale-95"
+              disabled={loading || success}
+              className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 active:scale-95 rounded-xl transition-all shadow-md shadow-rose-900/30 disabled:opacity-50 disabled:pointer-events-none"
             >
-              {loading ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Executing...</span>
-                </>
-              ) : (
-                <>
-                  <Trash2 className="w-4 h-4" />
-                  <span>
-                    {mode === 'everything_and_new_user' ? 'Clear Everything' : 'Clear Messages'}
-                  </span>
-                </>
-              )}
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{loading ? 'Wiping Database...' : 'Confirm Clear'}</span>
             </button>
           </div>
         </form>
-
       </div>
     </div>
   );
