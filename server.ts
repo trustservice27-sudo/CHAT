@@ -27,86 +27,7 @@ const distPath = path.resolve(__dirname, 'dist');
 const hasDist = fs.existsSync(path.resolve(distPath, 'index.html'));
 const isProduction = process.env.NODE_ENV === 'production' || (hasDist && process.env.NODE_ENV !== 'development');
 
-// Resilient Fallback Storage
-const dataDir = path.resolve(__dirname, 'database_store');
-if (!fs.existsSync(dataDir)) {
-  try {
-    fs.mkdirSync(dataDir, { recursive: true });
-  } catch {}
-}
-const primaryBackup = path.resolve(dataDir, 'cloud_chat_store.json');
-const tempBackup = path.resolve('/tmp', 'cloud_chat_store.json');
-
-interface StoredMessage {
-  id: string;
-  userId: string;
-  displayName: string;
-  photoURL?: string;
-  text: string;
-  createdAt: { seconds: number; nanoseconds: number };
-}
-
-let cachedMessages: StoredMessage[] = [];
 let lastClearTimestamp = Date.now();
-
-try {
-  if (fs.existsSync(primaryBackup)) {
-    cachedMessages = JSON.parse(fs.readFileSync(primaryBackup, 'utf-8'));
-  } else if (fs.existsSync(tempBackup)) {
-    cachedMessages = JSON.parse(fs.readFileSync(tempBackup, 'utf-8'));
-  }
-} catch {
-  cachedMessages = [];
-}
-
-function persistBackupStore() {
-  const content = JSON.stringify(cachedMessages.slice(-500), null, 2);
-  try {
-    fs.writeFileSync(primaryBackup, content, 'utf-8');
-  } catch {}
-  try {
-    fs.writeFileSync(tempBackup, content, 'utf-8');
-  } catch {}
-}
-
-// Global In-Memory Online Users & Typers Map (Fast, cross-client sync)
-const activeUsersMap = new Map<string, { userId: string; displayName: string; lastActive: number }>();
-const activeTypersMap = new Map<string, { userId: string; displayName: string; updatedAt: number }>();
-
-function getActiveOnlineUsers() {
-  const now = Date.now();
-  const list = [];
-  for (const [uid, user] of activeUsersMap.entries()) {
-    if (now - user.lastActive < 45000) {
-      list.push({
-        userId: user.userId,
-        displayName: user.displayName,
-        lastActive: { seconds: Math.floor(user.lastActive / 1000), nanoseconds: 0 }
-      });
-    } else {
-      activeUsersMap.delete(uid);
-    }
-  }
-  return list;
-}
-
-function getActiveTypers() {
-  const now = Date.now();
-  const list = [];
-  for (const [uid, t] of activeTypersMap.entries()) {
-    if (now - t.updatedAt < 5000) {
-      list.push({
-        userId: t.userId,
-        displayName: t.displayName,
-        isTyping: true,
-        timestamp: t.updatedAt
-      });
-    } else {
-      activeTypersMap.delete(uid);
-    }
-  }
-  return list;
-}
 
 // CORS & JSON body parser
 app.use((req, res, next) => {
@@ -137,7 +58,7 @@ function broadcastSSE(data: object) {
 }
 
 // Real-Time Server-Sent Events (SSE) Stream
-// With X-Accel-Buffering: no to prevent Cloud Run / mobile proxy buffering
+// 100% online cloud database powered
 app.get('/api/events', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -145,29 +66,25 @@ app.get('/api/events', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
-  let initialMessages = cachedMessages;
   try {
-    const dbList = await getDbMessages();
-    if (dbList && dbList.length > 0) {
-      initialMessages = dbList;
-      cachedMessages = dbList;
-      persistBackupStore();
-    }
+    const [initialMessages, onlineList, typersList] = await Promise.all([
+      getDbMessages(),
+      getDbOnlineUsers(),
+      getDbTypers(),
+    ]);
+
+    const initData = {
+      type: 'init',
+      messages: initialMessages,
+      onlineUsers: onlineList,
+      typingUsers: typersList,
+      lastClearTimestamp,
+    };
+    res.write(`data: ${JSON.stringify(initData)}\n\n`);
   } catch (err) {
-    console.warn('Initial load note:', err);
+    console.error('Error in SSE init from online database:', err);
+    res.write(`data: ${JSON.stringify({ type: 'init', messages: [], onlineUsers: [], typingUsers: [], lastClearTimestamp })}\n\n`);
   }
-
-  const onlineList = getActiveOnlineUsers();
-  const typersList = getActiveTypers();
-
-  const initData = {
-    type: 'init',
-    messages: initialMessages,
-    onlineUsers: onlineList,
-    typingUsers: typersList,
-    lastClearTimestamp,
-  };
-  res.write(`data: ${JSON.stringify(initData)}\n\n`);
 
   sseClients.add(res);
 
@@ -186,27 +103,18 @@ app.get('/api/events', async (req, res) => {
   });
 });
 
-// API: Get messages
+// API: Get messages directly from online cloud storage
 app.get('/api/messages', async (req, res) => {
   try {
-    let list = cachedMessages;
-    try {
-      const dbList = await getDbMessages();
-      if (dbList && dbList.length > 0) {
-        list = dbList;
-        cachedMessages = dbList;
-        persistBackupStore();
-      }
-    } catch (e) {
-      console.warn('Reading from resilient cache:', e);
-    }
+    const list = await getDbMessages();
     res.json({ success: true, messages: list, lastClearTimestamp });
   } catch (err: any) {
-    res.json({ success: true, messages: cachedMessages, lastClearTimestamp });
+    console.error('Error fetching online messages:', err);
+    res.status(500).json({ success: false, error: 'Database error', messages: [] });
   }
 });
 
-// API: Save message
+// API: Save message directly to online cloud storage
 app.post('/api/messages', async (req, res) => {
   try {
     const { userId, displayName, text, photoURL } = req.body || {};
@@ -216,117 +124,105 @@ app.post('/api/messages', async (req, res) => {
       return;
     }
 
-    const newMessage: StoredMessage = {
-      id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    // Save directly to online database
+    const saved = await insertDbMessage(
       userId,
-      displayName: displayName || 'Anonymous',
-      photoURL,
-      text: trimmed,
-      createdAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
-    };
+      displayName || 'Anonymous',
+      trimmed,
+      photoURL
+    );
 
-    // Save to resilient cache immediately
-    cachedMessages.push(newMessage);
-    if (cachedMessages.length > 500) {
-      cachedMessages = cachedMessages.slice(-500);
+    if (!saved) {
+      throw new Error('Failed to save to online storage');
     }
-    persistBackupStore();
 
-    // Async save to Cloud SQL
-    insertDbMessage(userId, displayName || 'Anonymous', trimmed, photoURL)
-      .then((sqlSaved) => {
-        if (sqlSaved) {
-          const idx = cachedMessages.findIndex((m) => m.id === newMessage.id);
-          if (idx !== -1) {
-            cachedMessages[idx].id = sqlSaved.id;
-            persistBackupStore();
-          }
-        }
-      })
-      .catch((err) => console.warn('Cloud SQL insert note:', err));
+    // Update presence
+    upsertDbPresence(userId, displayName || 'Anonymous').catch(() => {});
+    // Clear typing in online database
+    upsertDbTyping(userId, displayName || 'Anonymous', false).catch(() => {});
 
-    // Clear typing for this user
-    activeTypersMap.delete(userId);
-
-    // Broadcast in real-time to all connected users
+    // Broadcast immediately in real-time
     broadcastSSE({
       type: 'new_message',
-      message: newMessage,
+      message: saved,
     });
 
-    res.status(200).json({ success: true, message: newMessage });
+    res.status(200).json({ success: true, message: saved });
   } catch (err: any) {
+    console.error('Error saving message to online database:', err);
     res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });
 
-// API: Presence update (Returns active users directly for mobile polling)
+// API: Online presence update directly in online cloud storage
 app.post('/api/presence', async (req, res) => {
   const { userId, displayName } = req.body || {};
   if (userId) {
-    activeUsersMap.set(userId, {
-      userId,
-      displayName: displayName || 'Member',
-      lastActive: Date.now(),
-    });
+    try {
+      await upsertDbPresence(userId, displayName || 'Member');
+      const usersList = await getDbOnlineUsers();
 
-    // Background sync to Cloud SQL
-    upsertDbPresence(userId, displayName || 'Member').catch(() => {});
+      broadcastSSE({
+        type: 'presence',
+        onlineUsers: usersList,
+      });
 
-    const usersList = getActiveOnlineUsers();
-    broadcastSSE({
-      type: 'presence',
-      onlineUsers: usersList,
-    });
-
-    res.json({ success: true, onlineUsers: usersList });
-    return;
+      res.json({ success: true, onlineUsers: usersList });
+      return;
+    } catch (err) {
+      console.error('Error updating presence in online database:', err);
+    }
   }
-  res.json({ success: true, onlineUsers: getActiveOnlineUsers() });
+  const fallbackList = await getDbOnlineUsers().catch(() => []);
+  res.json({ success: true, onlineUsers: fallbackList });
 });
 
-// API: Typing status update (Returns typers directly for mobile polling)
+// API: Typing status directly in online cloud storage
 app.post('/api/typing', async (req, res) => {
   const { userId, displayName, isTyping } = req.body || {};
   if (userId) {
-    if (isTyping) {
-      activeTypersMap.set(userId, {
-        userId,
-        displayName: displayName || 'Member',
-        updatedAt: Date.now(),
+    try {
+      await upsertDbTyping(userId, displayName || 'Member', Boolean(isTyping));
+      const typersList = await getDbTypers();
+
+      broadcastSSE({
+        type: 'typing',
+        typingUsers: typersList,
       });
-    } else {
-      activeTypersMap.delete(userId);
+
+      res.json({ success: true, typingUsers: typersList });
+      return;
+    } catch (err) {
+      console.error('Error updating typing in online database:', err);
     }
-
-    // Background sync to Cloud SQL
-    upsertDbTyping(userId, displayName || 'Member', Boolean(isTyping)).catch(() => {});
-
-    const typersList = getActiveTypers();
-    broadcastSSE({
-      type: 'typing',
-      typingUsers: typersList,
-    });
-
-    res.json({ success: true, typingUsers: typersList });
-    return;
   }
-  res.json({ success: true, typingUsers: getActiveTypers() });
+  const fallbackTypers = await getDbTypers().catch(() => []);
+  res.json({ success: true, typingUsers: fallbackTypers });
 });
 
-// API: Mobile status poll (Every phone polls this every 1.5-2 seconds for guaranteed multi-phone live sync)
-app.get('/api/online-status', (req, res) => {
-  res.json({
-    success: true,
-    onlineUsers: getActiveOnlineUsers(),
-    typingUsers: getActiveTypers(),
-    messageCount: cachedMessages.length,
-    lastClearTimestamp,
-    lastMessageId: cachedMessages.length > 0 ? cachedMessages[cachedMessages.length - 1].id : null,
-  });
+// API: High-frequency polling endpoint directly query online cloud database
+app.get('/api/online-status', async (req, res) => {
+  try {
+    const [onlineUsers, typingUsers, currentMessages] = await Promise.all([
+      getDbOnlineUsers(),
+      getDbTypers(),
+      getDbMessages(),
+    ]);
+
+    res.json({
+      success: true,
+      onlineUsers,
+      typingUsers,
+      messageCount: currentMessages.length,
+      lastClearTimestamp,
+      lastMessageId: currentMessages.length > 0 ? currentMessages[currentMessages.length - 1].id : null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Database read error' });
+  }
 });
 
-// API: Clear chat with secret password
+// API: Clear chat directly in online cloud storage
 app.post('/api/clear-chat', async (req, res) => {
   try {
     const enteredPassword = (req.body?.password || '').trim();
@@ -343,23 +239,16 @@ app.post('/api/clear-chat', async (req, res) => {
       return;
     }
 
-    // 1. Update clear timestamp
     lastClearTimestamp = Date.now();
 
-    // 2. Wipe resilient cache
-    cachedMessages = [];
-    persistBackupStore();
-
-    // 3. Wipe active users/typing if everything requested
+    // Clear online cloud storage directly
     if (req.body?.mode === 'everything_and_new_user') {
-      activeUsersMap.clear();
-      activeTypersMap.clear();
-      clearDbEverything().catch(() => {});
+      await clearDbEverything();
     } else {
-      clearDbMessages().catch(() => {});
+      await clearDbMessages();
     }
 
-    // 4. Broadcast clear event to all screens worldwide with timestamp
+    // Broadcast clear event to all screens worldwide
     broadcastSSE({
       type: 'clear',
       lastClearTimestamp,
@@ -369,10 +258,10 @@ app.post('/api/clear-chat', async (req, res) => {
       success: true, 
       authorized: true, 
       lastClearTimestamp,
-      message: 'Chat history cleared successfully.' 
+      message: 'Online cloud database cleared successfully.' 
     });
   } catch (err: any) {
-    console.error('Clear error:', err);
+    console.error('Clear error in online database:', err);
     res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });

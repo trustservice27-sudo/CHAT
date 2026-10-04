@@ -15,40 +15,6 @@ import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
 import { Loader2 } from 'lucide-react';
 
-// Authoritative synchronization with server state:
-// 1. If server is empty/cleared -> immediately empty!
-// 2. Never restore messages that were deleted on the server.
-// 3. Only keep pending unconfirmed messages sent in the last 4 seconds.
-function syncServerMessages(existing: ChatMessage[], serverMsgs: ChatMessage[]): ChatMessage[] {
-  if (!serverMsgs || serverMsgs.length === 0) {
-    return [];
-  }
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  const pendingOptimistic = existing.filter(
-    (m) => m.id.startsWith('temp_') && (nowSec - (m.createdAt?.seconds || 0) < 4)
-  );
-
-  const serverMap = new Map<string, ChatMessage>();
-  serverMsgs.forEach((m) => serverMap.set(m.id, m));
-
-  // Retain pending optimistic messages only if not already confirmed by server
-  pendingOptimistic.forEach((opt) => {
-    const alreadyOnServer = serverMsgs.some(
-      (s) => s.userId === opt.userId && s.text === opt.text
-    );
-    if (!alreadyOnServer) {
-      serverMap.set(opt.id, opt);
-    }
-  });
-
-  return Array.from(serverMap.values()).sort((a, b) => {
-    const tA = (a.createdAt?.seconds || 0) * 1000 + (a.createdAt?.nanoseconds || 0) / 1000000;
-    const tB = (b.createdAt?.seconds || 0) * 1000 + (b.createdAt?.nanoseconds || 0) / 1000000;
-    return tA - tB;
-  });
-}
-
 export default function App() {
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(() => {
     try {
@@ -59,28 +25,11 @@ export default function App() {
     }
   });
 
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    try {
-      const cached = localStorage.getItem('openchat_messages_cache');
-      return cached ? JSON.parse(cached) : [];
-    } catch {
-      return [];
-    }
-  });
+  // 100% Online Cloud Database Storage (No local caching of messages)
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
-  const [messagesLoading, setMessagesLoading] = useState(false);
-
-  // Synchronize local cache with current message state
-  useEffect(() => {
-    try {
-      if (messages.length === 0) {
-        localStorage.removeItem('openchat_messages_cache');
-      } else {
-        localStorage.setItem('openchat_messages_cache', JSON.stringify(messages.slice(-200)));
-      }
-    } catch {}
-  }, [messages]);
+  const [messagesLoading, setMessagesLoading] = useState(true);
 
   // UI state
   const [searchQuery, setSearchQuery] = useState('');
@@ -89,64 +38,37 @@ export default function App() {
   const [infoModalOpen, setInfoModalOpen] = useState(false);
   const [scrollTrigger, setScrollTrigger] = useState(0);
 
-  // Audio & Clear Tracking
-  const initialLoadDone = useRef(false);
+  // Tracking refs
   const isTypingActiveRef = useRef(false);
-  const lastKnownCountRef = useRef(messages.length);
-  const lastClearTsRef = useRef<number>(
-    (() => {
-      try {
-        return Number(localStorage.getItem('openchat_clear_ts') || '0');
-      } catch {
-        return 0;
-      }
-    })()
-  );
+  const lastKnownCountRef = useRef(0);
+  const lastClearTsRef = useRef(0);
 
-  // Action to wipe messages across state and storage
-  const wipeAllMessagesLocal = (clearTs?: number) => {
-    setMessages([]);
-    lastKnownCountRef.current = 0;
-    if (clearTs) {
-      lastClearTsRef.current = clearTs;
-      try {
-        localStorage.setItem('openchat_clear_ts', String(clearTs));
-      } catch {}
-    }
-    try {
-      localStorage.removeItem('openchat_messages_cache');
-    } catch {}
-  };
-
-  // Helper to fetch authoritative message list from server
-  const fetchAuthoritativeMessages = () => {
+  // Fetch all chat history directly from online cloud database
+  const fetchOnlineMessages = () => {
     fetch('/api/messages')
       .then((res) => res.json())
       .then((data) => {
-        if (data.success) {
+        if (data.success && Array.isArray(data.messages)) {
           if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
-            wipeAllMessagesLocal(data.lastClearTimestamp);
-            return;
+            lastClearTsRef.current = data.lastClearTimestamp;
+            setMessages([]);
+            lastKnownCountRef.current = 0;
+          } else {
+            setMessages(data.messages);
+            lastKnownCountRef.current = data.messages.length;
           }
-
-          if (Array.isArray(data.messages)) {
-            if (data.messages.length === 0) {
-              wipeAllMessagesLocal();
-            } else {
-              setMessages((prev) => syncServerMessages(prev, data.messages));
-              lastKnownCountRef.current = data.messages.length;
-            }
-          }
-          setMessagesLoading(false);
-          initialLoadDone.current = true;
         }
+        setMessagesLoading(false);
       })
-      .catch((err) => console.warn('Message fetch note:', err));
+      .catch((err) => {
+        console.error('Error fetching online messages:', err);
+        setMessagesLoading(false);
+      });
   };
 
   // 1. Initial Load & Real-Time SSE Stream
   useEffect(() => {
-    fetchAuthoritativeMessages();
+    fetchOnlineMessages();
 
     let eventSource: EventSource | null = null;
 
@@ -158,15 +80,9 @@ export default function App() {
           const data = JSON.parse(event.data);
 
           if (data.type === 'init') {
-            if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
-              wipeAllMessagesLocal(data.lastClearTimestamp);
-            } else if (Array.isArray(data.messages)) {
-              if (data.messages.length === 0) {
-                wipeAllMessagesLocal();
-              } else {
-                setMessages((prev) => syncServerMessages(prev, data.messages));
-                lastKnownCountRef.current = data.messages.length;
-              }
+            if (Array.isArray(data.messages)) {
+              setMessages(data.messages);
+              lastKnownCountRef.current = data.messages.length;
             }
             if (Array.isArray(data.onlineUsers)) {
               setOnlineUsers(data.onlineUsers);
@@ -174,16 +90,20 @@ export default function App() {
             if (Array.isArray(data.typingUsers)) {
               setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
             }
+            if (data.lastClearTimestamp) {
+              lastClearTsRef.current = data.lastClearTimestamp;
+            }
             setMessagesLoading(false);
-            initialLoadDone.current = true;
 
           } else if (data.type === 'new_message' && data.message) {
             setMessages((prev) => {
-              // Add new message and avoid duplicate IDs
-              if (prev.some((m) => m.id === data.message.id)) return prev;
+              // Replace optimistic message if present, or append
               const filtered = prev.filter(
                 (m) => !(m.id.startsWith('temp_') && m.userId === data.message.userId && m.text === data.message.text)
               );
+              if (filtered.some((m) => m.id === data.message.id)) {
+                return filtered;
+              }
               return [...filtered, data.message];
             });
             lastKnownCountRef.current += 1;
@@ -200,8 +120,11 @@ export default function App() {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
 
           } else if (data.type === 'clear') {
-            // Immediate real-time clear received from another user!
-            wipeAllMessagesLocal(data.lastClearTimestamp || Date.now());
+            setMessages([]);
+            lastKnownCountRef.current = 0;
+            if (data.lastClearTimestamp) {
+              lastClearTsRef.current = data.lastClearTimestamp;
+            }
           }
         } catch (err) {
           console.warn('Error reading event stream:', err);
@@ -222,22 +145,19 @@ export default function App() {
     };
   }, [currentUser, soundEnabled]);
 
-  // 2. High-Frequency Fallback Polling (Every 1.5 seconds)
-  // Guarantees all phones and laptops see changes, clears, presence, and messages in real-time
+  // 2. High-Frequency Online Sync Polling (Every 1.5 seconds)
+  // Queries online cloud database continuously for instant cross-device synchronization
   useEffect(() => {
-    const pollStatus = async () => {
+    const pollOnlineDatabase = async () => {
       try {
         const res = await fetch('/api/online-status');
         const data = await res.json();
         if (data.success) {
-          // Check if another user cleared the chat room!
+          // If clear was triggered by another user on another phone
           if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
-            wipeAllMessagesLocal(data.lastClearTimestamp);
-            return;
-          }
-
-          if (data.messageCount === 0 && messages.length > 0) {
-            wipeAllMessagesLocal();
+            lastClearTsRef.current = data.lastClearTimestamp;
+            setMessages([]);
+            lastKnownCountRef.current = 0;
             return;
           }
 
@@ -248,19 +168,19 @@ export default function App() {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
           }
 
-          // If server message count changed, pull updates immediately
+          // If message count in online database changed, refresh immediately
           if (typeof data.messageCount === 'number' && data.messageCount !== lastKnownCountRef.current) {
-            fetchAuthoritativeMessages();
+            fetchOnlineMessages();
           }
         }
       } catch {}
     };
 
-    const interval = setInterval(pollStatus, 1500);
+    const interval = setInterval(pollOnlineDatabase, 1500);
     return () => clearInterval(interval);
-  }, [currentUser, messages.length]);
+  }, [currentUser]);
 
-  // 3. Online Presence Heartbeat
+  // 3. Online Presence Heartbeat in Online Cloud Database
   useEffect(() => {
     if (!currentUser) return;
 
@@ -333,7 +253,7 @@ export default function App() {
     } catch {}
   };
 
-  // Broadcast typing status
+  // Broadcast typing status to online database
   const handleTyping = (isTyping: boolean) => {
     if (!currentUser || isTypingActiveRef.current === isTyping) return;
     isTypingActiveRef.current = isTyping;
@@ -356,14 +276,14 @@ export default function App() {
       .catch(() => {});
   };
 
-  // Send message
+  // Send message directly to online cloud database
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
 
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    // Instant optimistic render
+    // Temporary optimistic representation
     const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const optimisticMessage: ChatMessage = {
       id: tempId,
@@ -379,7 +299,7 @@ export default function App() {
     setMessages((prev) => [...prev, optimisticMessage]);
     lastKnownCountRef.current += 1;
 
-    // Save to server
+    // Save directly to online cloud database
     try {
       const res = await fetch('/api/messages', {
         method: 'POST',
@@ -400,10 +320,10 @@ export default function App() {
         });
       }
     } catch (err) {
-      console.warn('Message send note:', err);
+      console.error('Failed to send to online database:', err);
     }
 
-    // Clear typing status
+    // Reset typing
     isTypingActiveRef.current = false;
     fetch('/api/typing', {
       method: 'POST',
@@ -418,10 +338,11 @@ export default function App() {
 
   // Reset Everything handler
   const handleResetEverything = () => {
-    wipeAllMessagesLocal(Date.now());
+    setMessages([]);
     setOnlineUsers([]);
     setTypingUsers([]);
     setCurrentUser(null);
+    lastKnownCountRef.current = 0;
     try {
       localStorage.removeItem('openchat_user');
       localStorage.removeItem('openchat_uid');
@@ -481,7 +402,7 @@ export default function App() {
           </div>
           <span className="text-[10px] text-emerald-400 font-medium hidden sm:inline-flex items-center gap-1.5 shrink-0">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-            Live Synced
+            Online Database
           </span>
         </div>
       )}
@@ -499,7 +420,7 @@ export default function App() {
             {messagesLoading && messages.length === 0 ? (
               <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
                 <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                <span className="text-xs">Connecting to chat room...</span>
+                <span className="text-xs">Loading chat history from cloud...</span>
               </div>
             ) : (
               <MessageList
@@ -530,7 +451,8 @@ export default function App() {
         onClose={() => setClearModalOpen(false)}
         currentUser={currentUser}
         onCleared={() => {
-          wipeAllMessagesLocal(Date.now());
+          setMessages([]);
+          lastKnownCountRef.current = 0;
         }}
         onResetAll={handleResetEverything}
       />
