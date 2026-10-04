@@ -90,11 +90,23 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({
       const res = onSendMessage(trimmed);
       if (res && typeof res.catch === 'function') {
         res.catch((err: any) => {
-          setError(err?.message || 'Failed to send message.');
+          const errMsg = err?.message || '';
+          if (
+            !errMsg.toLowerCase().includes('quota') &&
+            !errMsg.toLowerCase().includes('resource_exhausted')
+          ) {
+            setError(errMsg || 'Failed to send message.');
+          }
         });
       }
     } catch (err: any) {
-      setError(err?.message || 'Failed to send message.');
+      const errMsg = err?.message || '';
+      if (
+        !errMsg.toLowerCase().includes('quota') &&
+        !errMsg.toLowerCase().includes('resource_exhausted')
+      ) {
+        setError(errMsg || 'Failed to send message.');
+      }
     }
   };
 

@@ -108,7 +108,14 @@ export default function App() {
       },
       (error) => {
         setMessagesLoading(false);
-        setFirestoreError(error.message || 'Could not fetch live messages from online database.');
+        const errMsg = error?.message || '';
+        // Suppress quota exceeded and internal resource messages from UI
+        if (
+          !errMsg.toLowerCase().includes('quota') &&
+          !errMsg.toLowerCase().includes('resource_exhausted')
+        ) {
+          setFirestoreError(errMsg);
+        }
         handleFirestoreError(error, OperationType.GET, path);
       }
     );
@@ -428,7 +435,7 @@ export default function App() {
           /* Live Chat Room Layout */
           <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
             
-            {firestoreError && (
+            {firestoreError && !firestoreError.toLowerCase().includes('quota') && (
               <div className="shrink-0 max-w-4xl mx-auto w-full px-3 pt-2">
                 <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
                   <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
