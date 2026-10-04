@@ -1,4 +1,5 @@
-import express, { Response } from 'express';
+import express from 'express';
+import type { Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -12,6 +13,18 @@ const distPath = path.resolve(__dirname, 'dist');
 const hasDist = fs.existsSync(path.resolve(distPath, 'index.html'));
 const isProduction = process.env.NODE_ENV === 'production' || (hasDist && process.env.NODE_ENV !== 'development');
 
+// CORS & JSON body parser
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+    return;
+  }
+  next();
+});
+
 app.use(express.json());
 
 // ==========================================
@@ -19,9 +32,12 @@ app.use(express.json());
 // ==========================================
 const dataDir = path.resolve(__dirname, 'database_store');
 if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+  } catch {}
 }
-const messagesDbFile = path.resolve(dataDir, 'online_messages.json');
+const primaryDbFile = path.resolve(dataDir, 'online_messages.json');
+const fallbackDbFile = path.resolve('/tmp', 'openchat_online_messages.json');
 
 interface OnlineMessage {
   id: string;
@@ -36,9 +52,13 @@ interface OnlineMessage {
 
 let onlineMessages: OnlineMessage[] = [];
 
+// Load initial messages from whichever file exists
 try {
-  if (fs.existsSync(messagesDbFile)) {
-    const raw = fs.readFileSync(messagesDbFile, 'utf-8');
+  if (fs.existsSync(primaryDbFile)) {
+    const raw = fs.readFileSync(primaryDbFile, 'utf-8');
+    onlineMessages = JSON.parse(raw);
+  } else if (fs.existsSync(fallbackDbFile)) {
+    const raw = fs.readFileSync(fallbackDbFile, 'utf-8');
     onlineMessages = JSON.parse(raw);
   }
 } catch {
@@ -46,11 +66,13 @@ try {
 }
 
 function persistOnlineDatabase() {
+  const content = JSON.stringify(onlineMessages.slice(-500), null, 2);
   try {
-    fs.writeFileSync(messagesDbFile, JSON.stringify(onlineMessages.slice(-500), null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error saving to online database:', err);
-  }
+    fs.writeFileSync(primaryDbFile, content, 'utf-8');
+  } catch {}
+  try {
+    fs.writeFileSync(fallbackDbFile, content, 'utf-8');
+  } catch {}
 }
 
 // Active SSE Connections for Real-Time Live Messaging
@@ -113,7 +135,7 @@ app.get('/api/events', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  // Initial online database state
+  // Send current online database state to new connector
   const initData = {
     type: 'init',
     messages: onlineMessages,
@@ -131,7 +153,7 @@ app.get('/api/events', (req, res) => {
       clearInterval(pingInterval);
       sseClients.delete(res);
     }
-  }, 20000);
+  }, 15000);
 
   req.on('close', () => {
     clearInterval(pingInterval);
@@ -271,7 +293,10 @@ app.post('/api/clear-chat', (req, res) => {
 async function startServer() {
   if (isProduction && hasDist) {
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (req, res, next) => {
+      if (req.originalUrl.startsWith('/api')) {
+        return next();
+      }
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   } else {
@@ -282,6 +307,9 @@ async function startServer() {
     });
     app.use(vite.middlewares);
     app.use('*', async (req, res, next) => {
+      if (req.originalUrl.startsWith('/api')) {
+        return next();
+      }
       try {
         const url = req.originalUrl;
         let template = fs.readFileSync(path.resolve(__dirname, 'index.html'), 'utf-8');

@@ -70,10 +70,26 @@ export default function App() {
     }
   });
 
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    try {
+      const cached = localStorage.getItem('openchat_messages_cache');
+      return cached ? JSON.parse(cached) : [];
+    } catch {
+      return [];
+    }
+  });
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
-  const [messagesLoading, setMessagesLoading] = useState(true);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+
+  // Keep persistent client cache in sync so refresh never loses history
+  useEffect(() => {
+    if (messages.length > 0) {
+      try {
+        localStorage.setItem('openchat_messages_cache', JSON.stringify(messages.slice(-200)));
+      } catch {}
+    }
+  }, [messages]);
 
   // UI state
   const [searchQuery, setSearchQuery] = useState('');
@@ -397,6 +413,11 @@ export default function App() {
     setOnlineUsers([]);
     setTypingUsers([]);
     setCurrentUser(null);
+    try {
+      localStorage.removeItem('openchat_messages_cache');
+      localStorage.removeItem('openchat_user');
+      localStorage.removeItem('openchat_uid');
+    } catch {}
   };
 
   // Filter messages based on search query
@@ -502,6 +523,9 @@ export default function App() {
         currentUser={currentUser}
         onCleared={() => {
           setMessages([]);
+          try {
+            localStorage.removeItem('openchat_messages_cache');
+          } catch {}
         }}
         onResetAll={handleResetEverything}
       />
