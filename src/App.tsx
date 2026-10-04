@@ -13,7 +13,7 @@ import { AuthModal } from './components/AuthModal';
 import { ClearModal } from './components/ClearModal';
 import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
-import { Loader2, Database } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 
 function mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   const map = new Map<string, ChatMessage>();
@@ -68,7 +68,7 @@ export default function App() {
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
 
-  // Keep persistent client cache in sync so refresh never loses history
+  // Keep persistent client cache in sync so refresh on any mobile or laptop never loses history
   useEffect(() => {
     if (messages.length > 0) {
       try {
@@ -87,20 +87,26 @@ export default function App() {
   // Audio trigger tracking
   const initialLoadDone = useRef(false);
   const isTypingActiveRef = useRef(false);
+  const lastKnownCountRef = useRef(messages.length);
 
-  // 1. Google Cloud SQL Real-Time Stream (SSE) & Direct History Fetch
-  useEffect(() => {
-    // Immediate HTTP fetch of previous chat history from Google Cloud SQL database
+  // Helper function to fetch messages
+  const refreshMessages = () => {
     fetch('/api/messages')
       .then((res) => res.json())
       .then((data) => {
         if (data.success && Array.isArray(data.messages)) {
           setMessages((prev) => mergeMessages(prev, data.messages));
+          lastKnownCountRef.current = data.messages.length;
           setMessagesLoading(false);
           initialLoadDone.current = true;
         }
       })
-      .catch((err) => console.warn('Cloud SQL history fetch note:', err));
+      .catch((err) => console.warn('Message fetch note:', err));
+  };
+
+  // 1. Initial Load and Real-Time SSE Stream
+  useEffect(() => {
+    refreshMessages();
 
     let eventSource: EventSource | null = null;
 
@@ -114,6 +120,7 @@ export default function App() {
           if (data.type === 'init') {
             if (Array.isArray(data.messages)) {
               setMessages((prev) => mergeMessages(prev, data.messages));
+              lastKnownCountRef.current = data.messages.length;
               setMessagesLoading(false);
               initialLoadDone.current = true;
             }
@@ -125,6 +132,7 @@ export default function App() {
             }
           } else if (data.type === 'new_message' && data.message) {
             setMessages((prev) => mergeMessages(prev, [data.message]));
+            lastKnownCountRef.current += 1;
             setMessagesLoading(false);
 
             if (currentUser && data.message.userId !== currentUser.uid && soundEnabled) {
@@ -136,12 +144,13 @@ export default function App() {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
           } else if (data.type === 'clear') {
             setMessages([]);
+            lastKnownCountRef.current = 0;
             try {
               localStorage.removeItem('openchat_messages_cache');
             } catch {}
           }
         } catch (err) {
-          console.warn('Error reading Cloud SQL event stream:', err);
+          console.warn('Error reading event stream:', err);
         }
       };
 
@@ -149,7 +158,7 @@ export default function App() {
         // Automatically reconnects
       };
     } catch (e) {
-      console.warn('Cloud SQL stream init:', e);
+      console.warn('Event stream init:', e);
     }
 
     return () => {
@@ -159,7 +168,34 @@ export default function App() {
     };
   }, [currentUser, soundEnabled]);
 
-  // 2. Online Presence Heartbeat to Google Cloud SQL
+  // 2. High-Frequency Mobile Fallback Polling (Every 2 seconds)
+  // Ensures all users see each other's messages, typing, and presence across all phones and laptops
+  useEffect(() => {
+    const pollMobileStatus = async () => {
+      try {
+        const res = await fetch('/api/online-status');
+        const data = await res.json();
+        if (data.success) {
+          if (Array.isArray(data.onlineUsers)) {
+            setOnlineUsers(data.onlineUsers);
+          }
+          if (Array.isArray(data.typingUsers)) {
+            setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
+          }
+
+          // If message count on server differs from what we have, sync immediately
+          if (typeof data.messageCount === 'number' && data.messageCount !== lastKnownCountRef.current) {
+            refreshMessages();
+          }
+        }
+      } catch {}
+    };
+
+    const interval = setInterval(pollMobileStatus, 2000);
+    return () => clearInterval(interval);
+  }, [currentUser]);
+
+  // 3. Online Presence Heartbeat
   useEffect(() => {
     if (!currentUser) return;
 
@@ -171,11 +207,18 @@ export default function App() {
           userId: currentUser.uid,
           displayName: currentUser.displayName,
         }),
-      }).catch(() => {});
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data?.onlineUsers && Array.isArray(data.onlineUsers)) {
+            setOnlineUsers(data.onlineUsers);
+          }
+        })
+        .catch(() => {});
     };
 
     pingOnlinePresence();
-    const interval = setInterval(pingOnlinePresence, 20000);
+    const interval = setInterval(pingOnlinePresence, 12000);
     return () => clearInterval(interval);
   }, [currentUser]);
 
@@ -196,7 +239,14 @@ export default function App() {
         userId: user.uid,
         displayName: user.displayName,
       }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.onlineUsers && Array.isArray(data.onlineUsers)) {
+          setOnlineUsers(data.onlineUsers);
+        }
+      })
+      .catch(() => {});
   };
 
   // Leave room handler
@@ -222,7 +272,7 @@ export default function App() {
     }
   };
 
-  // Broadcast typing status to Google Cloud SQL
+  // Broadcast typing status
   const handleTyping = (isTyping: boolean) => {
     if (!currentUser || isTypingActiveRef.current === isTyping) return;
     isTypingActiveRef.current = isTyping;
@@ -235,10 +285,17 @@ export default function App() {
         displayName: currentUser.displayName,
         isTyping,
       }),
-    }).catch(() => {});
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.typingUsers && Array.isArray(data.typingUsers)) {
+          setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
+        }
+      })
+      .catch(() => {});
   };
 
-  // Send message directly to Google Cloud SQL Database
+  // Send message
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
 
@@ -259,10 +316,11 @@ export default function App() {
     };
 
     setMessages((prev) => [...prev, optimisticMessage]);
+    lastKnownCountRef.current += 1;
 
-    // 1. Save to Google Cloud SQL Database (Broadcasting live to all other users)
+    // Save to server
     try {
-      await fetch('/api/messages', {
+      const res = await fetch('/api/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -272,11 +330,15 @@ export default function App() {
           photoURL: currentUser.photoURL,
         }),
       });
+      const data = await res.json();
+      if (data?.message) {
+        setMessages((prev) => mergeMessages(prev, [data.message]));
+      }
     } catch (err) {
-      console.warn('Cloud SQL message save note:', err);
+      console.warn('Message send note:', err);
     }
 
-    // 2. Clear typing status
+    // Clear typing status
     isTypingActiveRef.current = false;
     fetch('/api/typing', {
       method: 'POST',
@@ -295,6 +357,7 @@ export default function App() {
     setOnlineUsers([]);
     setTypingUsers([]);
     setCurrentUser(null);
+    lastKnownCountRef.current = 0;
     try {
       localStorage.removeItem('openchat_messages_cache');
       localStorage.removeItem('openchat_user');
@@ -328,7 +391,7 @@ export default function App() {
         messageCount={messages.length}
       />
 
-      {/* Online Database Status Bar */}
+      {/* Online Status Bar */}
       {currentUser && (
         <div className="shrink-0 bg-slate-900/60 border-b border-slate-800/80 px-3 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between text-xs">
           <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar py-0.5">
@@ -405,6 +468,7 @@ export default function App() {
         currentUser={currentUser}
         onCleared={() => {
           setMessages([]);
+          lastKnownCountRef.current = 0;
           try {
             localStorage.removeItem('openchat_messages_cache');
           } catch {}
