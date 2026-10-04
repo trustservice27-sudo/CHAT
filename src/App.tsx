@@ -41,7 +41,7 @@ export default function App() {
   // Tracking refs
   const isTypingActiveRef = useRef(false);
   const lastKnownCountRef = useRef(0);
-  const lastClearTsRef = useRef(0);
+  const lastClearTsRef = useRef<number | null>(null);
 
   // Fetch all chat history directly from online cloud database
   const fetchOnlineMessages = () => {
@@ -49,7 +49,13 @@ export default function App() {
       .then((res) => res.json())
       .then((data) => {
         if (data.success && Array.isArray(data.messages)) {
-          if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
+          if (lastClearTsRef.current === null) {
+            // Initial load: set baseline timestamp and load all previous messages
+            lastClearTsRef.current = data.lastClearTimestamp || Date.now();
+            setMessages(data.messages);
+            lastKnownCountRef.current = data.messages.length;
+          } else if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
+            // New clear triggered after load
             lastClearTsRef.current = data.lastClearTimestamp;
             setMessages([]);
             lastKnownCountRef.current = 0;
@@ -154,7 +160,7 @@ export default function App() {
         const data = await res.json();
         if (data.success) {
           // If clear was triggered by another user on another phone
-          if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
+          if (lastClearTsRef.current !== null && data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
             lastClearTsRef.current = data.lastClearTimestamp;
             setMessages([]);
             lastKnownCountRef.current = 0;
@@ -373,6 +379,7 @@ export default function App() {
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
         messageCount={messages.length}
+        matchedCount={filteredMessages.length}
       />
 
       {/* Online Status Bar */}

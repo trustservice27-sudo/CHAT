@@ -16,6 +16,27 @@ interface MessageListProps {
   scrollTrigger?: number;
 }
 
+function highlightMatch(text: string, query: string) {
+  if (!query || !query.trim()) return text;
+  const q = query.trim();
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(`(${escaped})`, 'gi');
+  const parts = text.split(regex);
+
+  return parts.map((part, i) =>
+    regex.test(part) ? (
+      <mark
+        key={i}
+        className="bg-amber-400/40 text-amber-200 px-0.5 rounded font-semibold underline underline-offset-2"
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
+}
+
 // Generate consistent avatar colors from string hash
 function getAvatarGradient(str: string): string {
   const gradients = [
@@ -234,7 +255,7 @@ export const MessageList: React.FC<MessageListProps> = ({
                           : 'bg-slate-900 border border-slate-800 text-slate-100 rounded-tl-sm shadow-md text-left'
                       }`}
                     >
-                      {msg.text}
+                      {highlightMatch(msg.text, searchQuery)}
                     </div>
 
                     {/* Copy button */}
