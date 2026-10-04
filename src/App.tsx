@@ -4,8 +4,9 @@
  */
 
 import React, { useEffect, useState, useRef } from 'react';
-import type { ChatMessage, ChatUser, OnlineUser, TypingUser } from './types';
+import type { ChatMessage, ChatUser, OnlineUser, RoomMember, TypingUser } from './types';
 import { Header } from './components/Header';
+import { UserSidebar } from './components/UserSidebar';
 import { MessageList } from './components/MessageList';
 import { MessageComposer } from './components/MessageComposer';
 import { TypingIndicator } from './components/TypingIndicator';
@@ -28,10 +29,12 @@ export default function App() {
   // 100% Online Cloud Database Storage (No local caching of messages)
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
+  const [members, setMembers] = useState<RoomMember[]>([]);
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(true);
 
   // UI state
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [clearModalOpen, setClearModalOpen] = useState(false);
@@ -43,19 +46,17 @@ export default function App() {
   const lastKnownCountRef = useRef(0);
   const lastClearTsRef = useRef<number | null>(null);
 
-  // Fetch all chat history directly from online cloud database
-  const fetchOnlineMessages = () => {
+  // Fetch all chat history and members directly from online cloud database
+  const fetchOnlineData = () => {
     fetch('/api/messages')
       .then((res) => res.json())
       .then((data) => {
         if (data.success && Array.isArray(data.messages)) {
           if (lastClearTsRef.current === null) {
-            // Initial load: set baseline timestamp and load all previous messages
             lastClearTsRef.current = data.lastClearTimestamp || Date.now();
             setMessages(data.messages);
             lastKnownCountRef.current = data.messages.length;
           } else if (data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
-            // New clear triggered after load
             lastClearTsRef.current = data.lastClearTimestamp;
             setMessages([]);
             lastKnownCountRef.current = 0;
@@ -70,11 +71,20 @@ export default function App() {
         console.error('Error fetching online messages:', err);
         setMessagesLoading(false);
       });
+
+    fetch('/api/users')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.users)) {
+          setMembers(data.users);
+        }
+      })
+      .catch(() => {});
   };
 
   // 1. Initial Load & Real-Time SSE Stream
   useEffect(() => {
-    fetchOnlineMessages();
+    fetchOnlineData();
 
     let eventSource: EventSource | null = null;
 
@@ -93,6 +103,9 @@ export default function App() {
             if (Array.isArray(data.onlineUsers)) {
               setOnlineUsers(data.onlineUsers);
             }
+            if (Array.isArray(data.allUsers)) {
+              setMembers(data.allUsers);
+            }
             if (Array.isArray(data.typingUsers)) {
               setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
             }
@@ -103,7 +116,6 @@ export default function App() {
 
           } else if (data.type === 'new_message' && data.message) {
             setMessages((prev) => {
-              // Replace optimistic message if present, or append
               const filtered = prev.filter(
                 (m) => !(m.id.startsWith('temp_') && m.userId === data.message.userId && m.text === data.message.text)
               );
@@ -119,8 +131,13 @@ export default function App() {
               playNotificationSound();
             }
 
-          } else if (data.type === 'presence' && Array.isArray(data.onlineUsers)) {
-            setOnlineUsers(data.onlineUsers);
+          } else if (data.type === 'presence') {
+            if (Array.isArray(data.onlineUsers)) {
+              setOnlineUsers(data.onlineUsers);
+            }
+            if (Array.isArray(data.allUsers)) {
+              setMembers(data.allUsers);
+            }
 
           } else if (data.type === 'typing' && Array.isArray(data.typingUsers)) {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
@@ -159,7 +176,6 @@ export default function App() {
         const res = await fetch('/api/online-status');
         const data = await res.json();
         if (data.success) {
-          // If clear was triggered by another user on another phone
           if (lastClearTsRef.current !== null && data.lastClearTimestamp && data.lastClearTimestamp > lastClearTsRef.current) {
             lastClearTsRef.current = data.lastClearTimestamp;
             setMessages([]);
@@ -170,13 +186,15 @@ export default function App() {
           if (Array.isArray(data.onlineUsers)) {
             setOnlineUsers(data.onlineUsers);
           }
+          if (Array.isArray(data.allUsers)) {
+            setMembers(data.allUsers);
+          }
           if (Array.isArray(data.typingUsers)) {
             setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
           }
 
-          // If message count in online database changed, refresh immediately
           if (typeof data.messageCount === 'number' && data.messageCount !== lastKnownCountRef.current) {
-            fetchOnlineMessages();
+            fetchOnlineData();
           }
         }
       } catch {}
@@ -203,6 +221,9 @@ export default function App() {
         .then((data) => {
           if (data?.onlineUsers && Array.isArray(data.onlineUsers)) {
             setOnlineUsers(data.onlineUsers);
+          }
+          if (data?.allUsers && Array.isArray(data.allUsers)) {
+            setMembers(data.allUsers);
           }
         })
         .catch(() => {});
@@ -233,6 +254,9 @@ export default function App() {
       .then((data) => {
         if (data?.onlineUsers && Array.isArray(data.onlineUsers)) {
           setOnlineUsers(data.onlineUsers);
+        }
+        if (data?.allUsers && Array.isArray(data.allUsers)) {
+          setMembers(data.allUsers);
         }
       })
       .catch(() => {});
@@ -289,7 +313,6 @@ export default function App() {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    // Temporary optimistic representation
     const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const optimisticMessage: ChatMessage = {
       id: tempId,
@@ -305,7 +328,6 @@ export default function App() {
     setMessages((prev) => [...prev, optimisticMessage]);
     lastKnownCountRef.current += 1;
 
-    // Save directly to online cloud database
     try {
       const res = await fetch('/api/messages', {
         method: 'POST',
@@ -329,7 +351,6 @@ export default function App() {
       console.error('Failed to send to online database:', err);
     }
 
-    // Reset typing
     isTypingActiveRef.current = false;
     fetch('/api/typing', {
       method: 'POST',
@@ -346,6 +367,7 @@ export default function App() {
   const handleResetEverything = () => {
     setMessages([]);
     setOnlineUsers([]);
+    setMembers([]);
     setTypingUsers([]);
     setCurrentUser(null);
     lastKnownCountRef.current = 0;
@@ -380,75 +402,58 @@ export default function App() {
         onSearchChange={setSearchQuery}
         messageCount={messages.length}
         matchedCount={filteredMessages.length}
+        onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
+        isSidebarOpen={isSidebarOpen}
+        onlineCount={Math.max(1, onlineUsers.length)}
       />
 
-      {/* Online Status Bar */}
-      {currentUser && (
-        <div className="shrink-0 bg-slate-900/60 border-b border-slate-800/80 px-3 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between text-xs">
-          <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar py-0.5">
-            <span className="text-[10px] sm:text-[11px] font-semibold text-slate-400 flex items-center gap-1 shrink-0 uppercase tracking-wider">
-              <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              Online ({Math.max(1, onlineUsers.length)}):
-            </span>
-            <div className="flex items-center -space-x-1 shrink-0">
-              {onlineUsers.slice(0, 8).map((u) => (
-                <div 
-                  key={u.userId}
-                  title={`${u.displayName} (Online)`}
-                  className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-indigo-600/80 border border-slate-700 text-white font-bold text-[9px] sm:text-[10px] flex items-center justify-center ring-1 ring-slate-900"
-                >
-                  {(u.displayName || 'M')[0].toUpperCase()}
-                </div>
-              ))}
-            </div>
-            {onlineUsers.length > 8 && (
-              <span className="text-[9px] text-slate-400 bg-slate-800 px-1 py-0.5 rounded-full shrink-0">
-                +{onlineUsers.length - 8}
-              </span>
-            )}
-          </div>
-          <span className="text-[10px] text-emerald-400 font-medium hidden sm:inline-flex items-center gap-1.5 shrink-0">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-            Online Database
-          </span>
-        </div>
-      )}
-
       {/* Main Content Area */}
-      <main className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
+      <main className="flex-1 min-h-0 flex flex-row overflow-hidden relative">
         {!currentUser ? (
           /* Simple Instant Name Login Screen */
           <div className="flex-1 flex items-center justify-center p-3 sm:p-6 overflow-y-auto">
             <AuthModal onJoin={handleJoin} />
           </div>
         ) : (
-          /* Live Chat Room Layout */
-          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-            {messagesLoading && messages.length === 0 ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
-                <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                <span className="text-xs">Loading chat history from cloud...</span>
-              </div>
-            ) : (
-              <MessageList
-                messages={filteredMessages}
-                currentUser={currentUser}
-                searchQuery={searchQuery}
-                scrollTrigger={scrollTrigger}
-              />
-            )}
-
-            {/* Real-time Typing Indicator */}
-            <TypingIndicator typingUsers={typingUsers} />
-
-            {/* Message input bar */}
-            <MessageComposer
+          /* Live Chat Room Layout with Dedicated Left Sidebar */
+          <>
+            {/* Left Side: Real-Time User & Member List */}
+            <UserSidebar
               currentUser={currentUser}
-              onSendMessage={handleSendMessage}
-              onFocusInput={() => setScrollTrigger((prev) => prev + 1)}
-              onTyping={handleTyping}
+              members={members}
+              typingUsers={typingUsers}
+              isOpen={isSidebarOpen}
+              onClose={() => setIsSidebarOpen(false)}
             />
-          </div>
+
+            {/* Right Side: Chat Feed & Composer */}
+            <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-slate-950">
+              {messagesLoading && messages.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
+                  <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
+                  <span className="text-xs">Loading chat history from cloud...</span>
+                </div>
+              ) : (
+                <MessageList
+                  messages={filteredMessages}
+                  currentUser={currentUser}
+                  searchQuery={searchQuery}
+                  scrollTrigger={scrollTrigger}
+                />
+              )}
+
+              {/* Real-time Typing Indicator */}
+              <TypingIndicator typingUsers={typingUsers} />
+
+              {/* Message input bar */}
+              <MessageComposer
+                currentUser={currentUser}
+                onSendMessage={handleSendMessage}
+                onFocusInput={() => setScrollTrigger((prev) => prev + 1)}
+                onTyping={handleTyping}
+              />
+            </div>
+          </>
         )}
       </main>
 

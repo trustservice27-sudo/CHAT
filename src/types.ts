@@ -36,3 +36,10 @@ export interface TypingUser {
   timestamp: number;
 }
 
+export interface RoomMember {
+  userId: string;
+  displayName: string;
+  isOnline: boolean;
+  lastActive?: { seconds: number; nanoseconds: number } | null;
+}
+

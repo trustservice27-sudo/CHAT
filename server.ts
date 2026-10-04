@@ -12,6 +12,7 @@ import {
   insertDbMessage,
   upsertDbPresence,
   getDbOnlineUsers,
+  getAllDbUsers,
   upsertDbTyping,
   getDbTypers,
   clearDbMessages,
@@ -67,9 +68,10 @@ app.get('/api/events', async (req, res) => {
   res.flushHeaders?.();
 
   try {
-    const [initialMessages, onlineList, typersList] = await Promise.all([
+    const [initialMessages, onlineList, allUsersList, typersList] = await Promise.all([
       getDbMessages(),
       getDbOnlineUsers(),
+      getAllDbUsers(),
       getDbTypers(),
     ]);
 
@@ -77,13 +79,14 @@ app.get('/api/events', async (req, res) => {
       type: 'init',
       messages: initialMessages,
       onlineUsers: onlineList,
+      allUsers: allUsersList,
       typingUsers: typersList,
       lastClearTimestamp,
     };
     res.write(`data: ${JSON.stringify(initData)}\n\n`);
   } catch (err) {
     console.error('Error in SSE init from online database:', err);
-    res.write(`data: ${JSON.stringify({ type: 'init', messages: [], onlineUsers: [], typingUsers: [], lastClearTimestamp })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'init', messages: [], onlineUsers: [], allUsers: [], typingUsers: [], lastClearTimestamp })}\n\n`);
   }
 
   sseClients.add(res);
@@ -101,6 +104,16 @@ app.get('/api/events', async (req, res) => {
     clearInterval(pingInterval);
     sseClients.delete(res);
   });
+});
+
+// API: Get all users who have joined this website from online cloud storage
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await getAllDbUsers();
+    res.json({ success: true, users });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Database error', users: [] });
+  }
 });
 
 // API: Get messages directly from online cloud storage
@@ -160,21 +173,26 @@ app.post('/api/presence', async (req, res) => {
   if (userId) {
     try {
       await upsertDbPresence(userId, displayName || 'Member');
-      const usersList = await getDbOnlineUsers();
+      const [onlineList, allUsersList] = await Promise.all([
+        getDbOnlineUsers(),
+        getAllDbUsers(),
+      ]);
 
       broadcastSSE({
         type: 'presence',
-        onlineUsers: usersList,
+        onlineUsers: onlineList,
+        allUsers: allUsersList,
       });
 
-      res.json({ success: true, onlineUsers: usersList });
+      res.json({ success: true, onlineUsers: onlineList, allUsers: allUsersList });
       return;
     } catch (err) {
       console.error('Error updating presence in online database:', err);
     }
   }
   const fallbackList = await getDbOnlineUsers().catch(() => []);
-  res.json({ success: true, onlineUsers: fallbackList });
+  const allFallback = await getAllDbUsers().catch(() => []);
+  res.json({ success: true, onlineUsers: fallbackList, allUsers: allFallback });
 });
 
 // API: Typing status directly in online cloud storage
@@ -200,11 +218,12 @@ app.post('/api/typing', async (req, res) => {
   res.json({ success: true, typingUsers: fallbackTypers });
 });
 
-// API: High-frequency polling endpoint directly query online cloud database
+// API: High-frequency polling endpoint directly querying online cloud database
 app.get('/api/online-status', async (req, res) => {
   try {
-    const [onlineUsers, typingUsers, currentMessages] = await Promise.all([
+    const [onlineUsers, allUsers, typingUsers, currentMessages] = await Promise.all([
       getDbOnlineUsers(),
+      getAllDbUsers(),
       getDbTypers(),
       getDbMessages(),
     ]);
@@ -212,6 +231,7 @@ app.get('/api/online-status', async (req, res) => {
     res.json({
       success: true,
       onlineUsers,
+      allUsers,
       typingUsers,
       messageCount: currentMessages.length,
       lastClearTimestamp,

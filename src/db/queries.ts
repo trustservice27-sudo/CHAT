@@ -97,6 +97,35 @@ export async function upsertDbPresence(userId: string, displayName: string) {
   }
 }
 
+// Get all users who have joined this website from Google Cloud SQL
+export async function getAllDbUsers() {
+  try {
+    const rows = await db
+      .select()
+      .from(users)
+      .orderBy(desc(users.lastActive))
+      .limit(100);
+
+    const now = Date.now();
+    return rows.map((u) => {
+      const lastMs = new Date(u.lastActive).getTime();
+      const isOnline = now - lastMs < 60000; // active in last 60 seconds
+      return {
+        userId: u.userId,
+        displayName: u.displayName,
+        isOnline,
+        lastActive: {
+          seconds: Math.floor(lastMs / 1000),
+          nanoseconds: 0,
+        },
+      };
+    });
+  } catch (error) {
+    console.error('Error fetching all users from Cloud SQL:', error);
+    return [];
+  }
+}
+
 // Get online users from Google Cloud SQL (active in last 45 seconds)
 export async function getDbOnlineUsers() {
   try {

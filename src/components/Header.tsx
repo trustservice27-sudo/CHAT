@@ -7,7 +7,8 @@ import {
   Info, 
   LogOut, 
   X,
-  Bell
+  Bell,
+  Users
 } from 'lucide-react';
 import type { ChatUser } from '../types';
 import { playNotificationSound, unlockAudioContext } from '../utils/sound';
@@ -23,6 +24,9 @@ interface HeaderProps {
   onSearchChange: (q: string) => void;
   messageCount: number;
   matchedCount?: number;
+  onToggleSidebar?: () => void;
+  isSidebarOpen?: boolean;
+  onlineCount?: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -36,6 +40,9 @@ export const Header: React.FC<HeaderProps> = ({
   onSearchChange,
   messageCount,
   matchedCount,
+  onToggleSidebar,
+  isSidebarOpen,
+  onlineCount,
 }) => {
   const [showMobileSearch, setShowMobileSearch] = useState(false);
 
@@ -52,10 +59,30 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="shrink-0 bg-slate-900/95 backdrop-blur-md border-b border-slate-800 text-slate-100 shadow-sm z-30">
-      <div className="max-w-6xl mx-auto px-3 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-2 sm:gap-4">
+      <div className="max-w-7xl mx-auto px-3 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-2 sm:gap-4">
         
-        {/* Logo and Room Indicator */}
+        {/* Left: Sidebar Toggle + Logo and Room Indicator */}
         <div className="flex items-center gap-2 sm:gap-3 min-w-0 shrink-0">
+          {currentUser && onToggleSidebar && (
+            <button
+              onClick={onToggleSidebar}
+              className={`p-2 rounded-xl border transition-colors flex items-center gap-1.5 ${
+                isSidebarOpen
+                  ? 'bg-indigo-600/20 border-indigo-500/30 text-indigo-300'
+                  : 'bg-slate-800/80 border-slate-700/80 text-slate-300 hover:text-white hover:bg-slate-700'
+              }`}
+              title="Toggle Members Sidebar"
+              aria-label="Toggle Members Sidebar"
+            >
+              <Users className="w-4 h-4 text-indigo-400" />
+              {typeof onlineCount === 'number' && (
+                <span className="text-[10px] font-semibold text-emerald-400 hidden sm:inline">
+                  {onlineCount}
+                </span>
+              )}
+            </button>
+          )}
+
           <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 p-[1.5px] shadow-md shadow-indigo-500/20 shrink-0">
             <div className="w-full h-full bg-slate-900 rounded-[10px] flex items-center justify-center">
               <span className="text-base sm:text-lg font-bold bg-gradient-to-tr from-indigo-400 to-cyan-300 bg-clip-text text-transparent">
