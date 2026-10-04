@@ -29,6 +29,37 @@ import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
 import { Loader2, Sparkles, Database } from 'lucide-react';
 
+function mergeMessages(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  const map = new Map<string, ChatMessage>();
+
+  existing.forEach((m) => map.set(m.id, m));
+
+  incoming.forEach((newMsg) => {
+    // If a temporary optimistic message exists with matching user and text, replace it
+    let matchedTempId: string | null = null;
+    for (const [id, ex] of map.entries()) {
+      if (
+        id.startsWith('temp_') &&
+        ex.userId === newMsg.userId &&
+        ex.text === newMsg.text
+      ) {
+        matchedTempId = id;
+        break;
+      }
+    }
+    if (matchedTempId) {
+      map.delete(matchedTempId);
+    }
+    map.set(newMsg.id, newMsg);
+  });
+
+  return Array.from(map.values()).sort((a, b) => {
+    const tA = (a.createdAt?.seconds || 0) * 1000 + (a.createdAt?.nanoseconds || 0) / 1000000;
+    const tB = (b.createdAt?.seconds || 0) * 1000 + (b.createdAt?.nanoseconds || 0) / 1000000;
+    return tA - tB;
+  });
+}
+
 export default function App() {
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(() => {
     try {
@@ -56,10 +87,77 @@ export default function App() {
   const prevMessagesCount = useRef(0);
   const isTypingActiveRef = useRef(false);
 
-  // 1. ALL MESSAGES saved & synced directly in the ONLINE DATABASE (Firestore)
+  // 1. Central Online Database Real-Time Stream (SSE) & Direct History Fetch
+  // Ensures all previous chats immediately load for ANY user from ANYWHERE in the world
   useEffect(() => {
-    setMessagesLoading(true);
+    // Immediate HTTP fetch of previous chat history from the online database
+    fetch('/api/messages')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.messages)) {
+          setMessages((prev) => mergeMessages(prev, data.messages));
+          setMessagesLoading(false);
+          initialLoadDone.current = true;
+        }
+      })
+      .catch((err) => console.warn('Online database history fetch error:', err));
 
+    let eventSource: EventSource | null = null;
+
+    try {
+      eventSource = new EventSource('/api/events');
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'init') {
+            if (Array.isArray(data.messages)) {
+              setMessages((prev) => mergeMessages(prev, data.messages));
+              setMessagesLoading(false);
+              initialLoadDone.current = true;
+            }
+            if (Array.isArray(data.onlineUsers)) {
+              setOnlineUsers(data.onlineUsers);
+            }
+            if (Array.isArray(data.typingUsers)) {
+              setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
+            }
+          } else if (data.type === 'new_message' && data.message) {
+            setMessages((prev) => mergeMessages(prev, [data.message]));
+            setMessagesLoading(false);
+
+            if (currentUser && data.message.userId !== currentUser.uid && soundEnabled) {
+              playNotificationSound();
+            }
+          } else if (data.type === 'presence' && Array.isArray(data.onlineUsers)) {
+            setOnlineUsers(data.onlineUsers);
+          } else if (data.type === 'typing' && Array.isArray(data.typingUsers)) {
+            setTypingUsers(data.typingUsers.filter((t: TypingUser) => t.userId !== currentUser?.uid));
+          } else if (data.type === 'clear') {
+            setMessages([]);
+          }
+        } catch (err) {
+          console.warn('Error reading online database stream:', err);
+        }
+      };
+
+      eventSource.onerror = () => {
+        // Automatically reconnects
+      };
+    } catch (e) {
+      console.warn('Online database stream init:', e);
+    }
+
+    return () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+    };
+  }, [currentUser, soundEnabled]);
+
+  // 2. Parallel Cloud Firestore Listener (with graceful quota resilience)
+  useEffect(() => {
     const path = 'messages';
     const messagesQuery = query(
       collection(db, path),
@@ -84,7 +182,6 @@ export default function App() {
           };
         });
 
-        // Chime for incoming message from other online users
         if (
           initialLoadDone.current &&
           loaded.length > prevMessagesCount.current &&
@@ -98,13 +195,13 @@ export default function App() {
 
         prevMessagesCount.current = loaded.length;
         initialLoadDone.current = true;
-        setMessages(loaded);
+        setMessages((prev) => mergeMessages(prev, loaded));
         setMessagesLoading(false);
       },
       (error) => {
         setMessagesLoading(false);
         const errMsg = error instanceof Error ? error.message : String(error);
-        if (!errMsg.toLowerCase().includes('quota')) {
+        if (!errMsg.toLowerCase().includes('quota') && !errMsg.toLowerCase().includes('resource-exhausted')) {
           handleFirestoreError(error, OperationType.GET, path);
         }
       }
@@ -113,91 +210,21 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, soundEnabled]);
 
-  // 2. ALL ONLINE USERS saved & synced directly in the ONLINE DATABASE (Firestore)
-  useEffect(() => {
-    const usersPath = 'users';
-    const usersQuery = query(
-      collection(db, usersPath),
-      limit(50)
-    );
-
-    const unsubscribe = onSnapshot(
-      usersQuery,
-      (snapshot) => {
-        const now = Date.now();
-        const users: OnlineUser[] = snapshot.docs
-          .map((docSnap) => {
-            const data = docSnap.data();
-            return {
-              userId: docSnap.id,
-              displayName: data.displayName || 'Member',
-              lastActive: data.lastActive,
-            };
-          })
-          .filter((u) => {
-            if (!u.lastActive) return true;
-            const seconds = typeof u.lastActive.seconds === 'number' 
-              ? u.lastActive.seconds 
-              : Math.floor(now / 1000);
-            return (now / 1000 - seconds) < 90; // Active in last 90 seconds
-          });
-
-        setOnlineUsers(users);
-      },
-      (error) => {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (!errMsg.toLowerCase().includes('quota')) {
-          handleFirestoreError(error, OperationType.LIST, usersPath);
-        }
-      }
-    );
-
-    return () => unsubscribe();
-  }, []);
-
-  // 3. ALL TYPING STATUS saved & synced directly in the ONLINE DATABASE (Firestore)
-  useEffect(() => {
-    const typingPath = 'typing';
-    const unsubscribe = onSnapshot(
-      collection(db, typingPath),
-      (snapshot) => {
-        const now = Date.now();
-        const active: TypingUser[] = [];
-
-        snapshot.docs.forEach((docSnap) => {
-          const data = docSnap.data();
-          if (
-            data.isTyping &&
-            data.userId !== currentUser?.uid &&
-            now - (data.timestamp || 0) < 5000
-          ) {
-            active.push({
-              userId: data.userId,
-              displayName: data.displayName || 'Someone',
-              isTyping: true,
-              timestamp: data.timestamp,
-            });
-          }
-        });
-
-        setTypingUsers(active);
-      },
-      (error) => {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (!errMsg.toLowerCase().includes('quota')) {
-          handleFirestoreError(error, OperationType.LIST, typingPath);
-        }
-      }
-    );
-
-    return () => unsubscribe();
-  }, [currentUser]);
-
-  // 4. Online Presence Heartbeat saved directly to ONLINE DATABASE
+  // 3. Online Presence Heartbeat to Online Database
   useEffect(() => {
     if (!currentUser) return;
 
-    const pingOnlineDatabase = () => {
+    const pingOnlinePresence = () => {
+      fetch('/api/presence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.uid,
+          displayName: currentUser.displayName,
+        }),
+      }).catch(() => {});
+
+      // Background Firestore ping
       setDoc(doc(db, 'users', currentUser.uid), {
         userId: currentUser.uid,
         displayName: currentUser.displayName,
@@ -205,8 +232,8 @@ export default function App() {
       }, { merge: true }).catch(() => {});
     };
 
-    pingOnlineDatabase();
-    const interval = setInterval(pingOnlineDatabase, 30000);
+    pingOnlinePresence();
+    const interval = setInterval(pingOnlinePresence, 20000);
     return () => clearInterval(interval);
   }, [currentUser]);
 
@@ -220,19 +247,35 @@ export default function App() {
       // Ignore
     }
 
-    // Save directly to the online database
+    fetch('/api/presence', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: user.uid,
+        displayName: user.displayName,
+      }),
+    }).catch(() => {});
+
     setDoc(doc(db, 'users', user.uid), {
       userId: user.uid,
       displayName: user.displayName,
       lastActive: serverTimestamp(),
-    }, { merge: true }).catch((err) => {
-      handleFirestoreError(err, OperationType.WRITE, 'users');
-    });
+    }, { merge: true }).catch(() => {});
   };
 
   // Leave room handler
   const handleSignOut = () => {
     if (currentUser) {
+      fetch('/api/typing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.uid,
+          displayName: currentUser.displayName,
+          isTyping: false,
+        }),
+      }).catch(() => {});
+
       setDoc(doc(db, 'typing', currentUser.uid), {
         userId: currentUser.uid,
         displayName: currentUser.displayName,
@@ -250,10 +293,20 @@ export default function App() {
     }
   };
 
-  // Broadcast typing status directly to ONLINE DATABASE
+  // Broadcast typing status
   const handleTyping = (isTyping: boolean) => {
     if (!currentUser || isTypingActiveRef.current === isTyping) return;
     isTypingActiveRef.current = isTyping;
+
+    fetch('/api/typing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        isTyping,
+      }),
+    }).catch(() => {});
 
     setDoc(doc(db, 'typing', currentUser.uid), {
       userId: currentUser.uid,
@@ -263,28 +316,14 @@ export default function App() {
     }, { merge: true }).catch(() => {});
   };
 
-  // Send message directly to the ONLINE DATABASE
+  // Send message directly to Online Database
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
 
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    const path = 'messages';
-    const payload = {
-      userId: currentUser.uid,
-      displayName: currentUser.displayName,
-      text: trimmed,
-      createdAt: serverTimestamp(),
-      readBy: [currentUser.uid],
-      seenBy: [{
-        userId: currentUser.uid,
-        displayName: currentUser.displayName,
-        seenAt: Date.now(),
-      }],
-    };
-
-    // Instant optimistic render on screen
+    // Instant optimistic render
     const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const optimisticMessage: ChatMessage = {
       id: tempId,
@@ -299,23 +338,57 @@ export default function App() {
 
     setMessages((prev) => [...prev, optimisticMessage]);
 
+    // 1. Save to Central Online Database (Broadcasting live to all other users)
     try {
-      // Direct save to online database (Firestore)
-      await addDoc(collection(db, path), payload);
+      await fetch('/api/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.uid,
+          displayName: currentUser.displayName,
+          text: trimmed,
+          photoURL: currentUser.photoURL,
+        }),
+      });
+    } catch (err) {
+      console.warn('Online database message save note:', err);
+    }
 
-      // Clear typing in online database
-      isTypingActiveRef.current = false;
-      setDoc(doc(db, 'typing', currentUser.uid), {
+    // 2. Clear typing status
+    isTypingActiveRef.current = false;
+    fetch('/api/typing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
         userId: currentUser.uid,
         displayName: currentUser.displayName,
         isTyping: false,
-        timestamp: Date.now(),
-      }, { merge: true }).catch(() => {});
-    } catch (error: any) {
-      setMessages((prev) => prev.filter((m) => m.id !== tempId));
-      handleFirestoreError(error, OperationType.CREATE, path);
-      throw error;
-    }
+      }),
+    }).catch(() => {});
+
+    // 3. Background sync to Firestore Cloud
+    const path = 'messages';
+    const payload = {
+      userId: currentUser.uid,
+      displayName: currentUser.displayName,
+      text: trimmed,
+      createdAt: serverTimestamp(),
+      readBy: [currentUser.uid],
+      seenBy: [{
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        seenAt: Date.now(),
+      }],
+    };
+
+    addDoc(collection(db, path), payload).catch(() => {});
+
+    setDoc(doc(db, 'typing', currentUser.uid), {
+      userId: currentUser.uid,
+      displayName: currentUser.displayName,
+      isTyping: false,
+      timestamp: Date.now(),
+    }, { merge: true }).catch(() => {});
   };
 
   // Reset Everything handler
@@ -352,7 +425,7 @@ export default function App() {
         messageCount={messages.length}
       />
 
-      {/* Online Database Live Status Bar */}
+      {/* Online Database Status Bar */}
       {currentUser && (
         <div className="shrink-0 bg-slate-900/60 border-b border-slate-800/80 px-3 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between text-xs">
           <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar py-0.5">
@@ -377,9 +450,9 @@ export default function App() {
               </span>
             )}
           </div>
-          <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline-flex items-center gap-1 shrink-0">
-            <Database className="w-3 h-3 text-emerald-400" />
-            Online Database
+          <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline-flex items-center gap-1.5 shrink-0">
+            <Database className="w-3.5 h-3.5 text-emerald-400" />
+            Online Cloud Sync
           </span>
         </div>
       )}

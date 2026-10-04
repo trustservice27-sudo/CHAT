@@ -46,7 +46,7 @@ export const ClearModal: React.FC<ClearModalProps> = ({
     e.preventDefault();
     const entered = password.trim();
     if (!entered) {
-      setError('Please enter the security code.');
+      setError('Please enter the secret passcode.');
       return;
     }
 
@@ -54,46 +54,34 @@ export const ClearModal: React.FC<ClearModalProps> = ({
     setError(null);
 
     try {
-      let authorized = false;
+      // 1. Clear Central Online Database via server API
+      const res = await fetch('/api/clear-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: entered })
+      });
+      
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || 'Incorrect passcode. Access denied.');
+      }
 
+      // 2. Also clear Firestore Cloud collections in background (with safe error handling for quota limits)
       try {
-        const res = await fetch('/api/clear-chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: entered })
-        });
-        if (res.ok) {
-          const data = await res.json().catch(() => ({}));
-          if (data && data.success) {
-            authorized = true;
-          }
+        const messagesSnap = await getDocs(collection(db, 'messages'));
+        if (!messagesSnap.empty) {
+          const batch = writeBatch(db);
+          messagesSnap.docs.forEach((docSnap) => {
+            batch.delete(docSnap.ref);
+          });
+          await batch.commit();
         }
-      } catch {
-        // Fallback for static hosting
+      } catch (fsErr) {
+        console.warn('Firestore online collection clear note:', fsErr);
       }
 
-      // If server endpoint is unreachable, verify security code directly
-      if (!authorized) {
-        if (entered.toUpperCase() === 'ADMIN') {
-          authorized = true;
-        } else {
-          throw new Error('Incorrect security code. Access denied.');
-        }
-      }
-
-      // 1. Delete all messages from Firestore
-      const messagesSnap = await getDocs(collection(db, 'messages'));
-      if (!messagesSnap.empty) {
-        const batch = writeBatch(db);
-        messagesSnap.docs.forEach((docSnap) => {
-          batch.delete(docSnap.ref);
-        });
-        await batch.commit();
-      }
-
-      // 2. If "Clear Everything & Start as New User" is selected:
+      // 3. If "Clear Everything & Start as New User" is selected:
       if (mode === 'everything_and_new_user') {
-        // Delete users collection in Firestore
         try {
           const usersSnap = await getDocs(collection(db, 'users'));
           if (!usersSnap.empty) {
@@ -103,11 +91,10 @@ export const ClearModal: React.FC<ClearModalProps> = ({
             });
             await userBatch.commit();
           }
-        } catch {
-          // Ignore partial cleanup errors
+        } catch (fsErr) {
+          console.warn('Firestore users collection clear note:', fsErr);
         }
 
-        // Delete typing collection in Firestore
         try {
           const typingSnap = await getDocs(collection(db, 'typing'));
           if (!typingSnap.empty) {
@@ -117,11 +104,11 @@ export const ClearModal: React.FC<ClearModalProps> = ({
             });
             await typingBatch.commit();
           }
-        } catch {
-          // Ignore partial cleanup errors
+        } catch (fsErr) {
+          console.warn('Firestore typing collection clear note:', fsErr);
         }
 
-        // Clear local storage and reset identity
+        // Clear user session
         try {
           localStorage.removeItem('openchat_user');
           localStorage.removeItem('openchat_uid');
@@ -241,7 +228,7 @@ export const ClearModal: React.FC<ClearModalProps> = ({
         <form onSubmit={handleClear} className="space-y-4">
           <div>
             <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
-              Admin Security Code
+              Security Passcode
             </label>
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
@@ -251,7 +238,7 @@ export const ClearModal: React.FC<ClearModalProps> = ({
                 type={showPassword ? 'text' : 'password'}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter security code..."
+                placeholder="Enter secret passcode..."
                 disabled={loading || success}
                 autoFocus
                 className="w-full pl-9 pr-10 py-2.5 bg-slate-950/80 border border-slate-700/80 rounded-xl text-slate-100 placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-rose-500/50 focus:border-rose-500/50 transition-all font-mono"
