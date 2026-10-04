@@ -9,7 +9,10 @@ import {
   CheckCircle2, 
   Loader2, 
   ShieldAlert,
-  Server
+  Server,
+  UserX,
+  MessageSquareX,
+  RotateCcw
 } from 'lucide-react';
 import { db, collection, getDocs, writeBatch } from '../firebase';
 import type { ChatUser } from '../types';
@@ -19,13 +22,18 @@ interface ClearModalProps {
   onClose: () => void;
   currentUser?: ChatUser | null;
   onCleared: () => void;
+  onResetAll?: () => void;
 }
+
+type ClearMode = 'messages_only' | 'everything_and_new_user';
 
 export const ClearModal: React.FC<ClearModalProps> = ({
   isOpen,
   onClose,
   onCleared,
+  onResetAll,
 }) => {
+  const [mode, setMode] = useState<ClearMode>('everything_and_new_user');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -61,49 +69,92 @@ export const ClearModal: React.FC<ClearModalProps> = ({
           }
         }
       } catch {
-        // Fallback for static hosts (e.g. Netlify)
+        // Fallback for static hosting
       }
 
-      // If server endpoint is unreachable (e.g. static host), verify security code directly
+      // If server endpoint is unreachable, verify security code directly
       if (!authorized) {
-        if (entered === 'ADMIN') {
+        if (entered.toUpperCase() === 'ADMIN') {
           authorized = true;
         } else {
           throw new Error('Incorrect security code. Access denied.');
         }
       }
 
-      // Delete messages from Firestore collection
-      const snapshot = await getDocs(collection(db, 'messages'));
-      if (!snapshot.empty) {
+      // 1. Delete all messages from Firestore
+      const messagesSnap = await getDocs(collection(db, 'messages'));
+      if (!messagesSnap.empty) {
         const batch = writeBatch(db);
-        snapshot.docs.forEach((docSnap) => {
+        messagesSnap.docs.forEach((docSnap) => {
           batch.delete(docSnap.ref);
         });
         await batch.commit();
       }
 
+      // 2. If "Clear Everything & Start as New User" is selected:
+      if (mode === 'everything_and_new_user') {
+        // Delete users collection in Firestore
+        try {
+          const usersSnap = await getDocs(collection(db, 'users'));
+          if (!usersSnap.empty) {
+            const userBatch = writeBatch(db);
+            usersSnap.docs.forEach((docSnap) => {
+              userBatch.delete(docSnap.ref);
+            });
+            await userBatch.commit();
+          }
+        } catch {
+          // Ignore partial cleanup errors
+        }
+
+        // Delete typing collection in Firestore
+        try {
+          const typingSnap = await getDocs(collection(db, 'typing'));
+          if (!typingSnap.empty) {
+            const typingBatch = writeBatch(db);
+            typingSnap.docs.forEach((docSnap) => {
+              typingBatch.delete(docSnap.ref);
+            });
+            await typingBatch.commit();
+          }
+        } catch {
+          // Ignore partial cleanup errors
+        }
+
+        // Clear local storage and reset identity
+        try {
+          localStorage.removeItem('openchat_user');
+          localStorage.removeItem('openchat_uid');
+        } catch {
+          // Ignore
+        }
+      }
+
       setSuccess(true);
       setTimeout(() => {
-        onCleared();
+        if (mode === 'everything_and_new_user') {
+          onResetAll?.();
+        } else {
+          onCleared();
+        }
         onClose();
         setPassword('');
         setSuccess(false);
       }, 1000);
     } catch (err: any) {
-      setError(err.message || 'Incorrect code or failed to clear messages.');
+      setError(err.message || 'Incorrect security code or operation failed.');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
       <div 
-        className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl p-6 sm:p-7 relative overflow-hidden"
+        className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl p-5 sm:p-7 relative overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Subtle decorative glow */}
+        {/* Decorative glow */}
         <div className="absolute -top-12 -right-12 w-32 h-32 bg-rose-500/10 rounded-full blur-2xl pointer-events-none"></div>
 
         {/* Close Button */}
@@ -116,14 +167,14 @@ export const ClearModal: React.FC<ClearModalProps> = ({
           <X className="w-5 h-5" />
         </button>
 
-        {/* Header Icon */}
+        {/* Header */}
         <div className="flex items-center gap-3 mb-4">
           <div className="w-11 h-11 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center justify-center shrink-0">
             <ShieldAlert className="w-6 h-6" />
           </div>
           <div>
             <h3 className="text-lg font-bold text-slate-100">
-              Clear Public Chat Room
+              Clear & Reset Options
             </h3>
             <span className="text-xs text-rose-400 font-medium flex items-center gap-1">
               <Server className="w-3 h-3" /> Security Protected
@@ -131,17 +182,66 @@ export const ClearModal: React.FC<ClearModalProps> = ({
           </div>
         </div>
 
-        {/* Description */}
-        <p className="text-sm text-slate-300 mb-5 leading-relaxed">
-          This operation will permanently delete all messages in the public room for everyone.
-          Enter authorization to confirm.
-        </p>
+        {/* Mode Selector */}
+        <div className="grid grid-cols-1 gap-2 mb-4">
+          <label 
+            onClick={() => setMode('everything_and_new_user')}
+            className={`p-3 rounded-2xl border cursor-pointer transition-all flex items-start gap-3 ${
+              mode === 'everything_and_new_user'
+                ? 'bg-rose-500/15 border-rose-500/50 text-white shadow-md shadow-rose-950/30'
+                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:border-slate-700'
+            }`}
+          >
+            <input 
+              type="radio" 
+              name="clear_mode" 
+              checked={mode === 'everything_and_new_user'} 
+              onChange={() => setMode('everything_and_new_user')}
+              className="mt-1 accent-rose-500"
+            />
+            <div className="flex-1">
+              <div className="text-sm font-semibold flex items-center gap-1.5 text-slate-100">
+                <RotateCcw className="w-4 h-4 text-rose-400" />
+                Clear Everything & Make a New User
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+                Wipes all messages, resets users and online sessions, and resets your profile to join fresh as a new user.
+              </p>
+            </div>
+          </label>
+
+          <label 
+            onClick={() => setMode('messages_only')}
+            className={`p-3 rounded-2xl border cursor-pointer transition-all flex items-start gap-3 ${
+              mode === 'messages_only'
+                ? 'bg-rose-500/15 border-rose-500/50 text-white shadow-md shadow-rose-950/30'
+                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:border-slate-700'
+            }`}
+          >
+            <input 
+              type="radio" 
+              name="clear_mode" 
+              checked={mode === 'messages_only'} 
+              onChange={() => setMode('messages_only')}
+              className="mt-1 accent-rose-500"
+            />
+            <div className="flex-1">
+              <div className="text-sm font-semibold flex items-center gap-1.5 text-slate-100">
+                <MessageSquareX className="w-4 h-4 text-rose-400" />
+                Clear Messages Only
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+                Deletes all chat messages, keeping your current name and active session.
+              </p>
+            </div>
+          </label>
+        </div>
 
         {/* Form */}
         <form onSubmit={handleClear} className="space-y-4">
           <div>
-            <label className="sr-only">
-              Security Code
+            <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
+              Admin Security Code
             </label>
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
@@ -178,11 +278,15 @@ export const ClearModal: React.FC<ClearModalProps> = ({
           {success && (
             <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2 animate-in fade-in">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>Success! All public room messages have been cleared.</span>
+              <span>
+                {mode === 'everything_and_new_user'
+                  ? 'All data cleared! Resetting as a new user...'
+                  : 'All messages have been successfully cleared.'}
+              </span>
             </div>
           )}
 
-          <div className="flex items-center justify-end gap-3 pt-2">
+          <div className="flex items-center justify-end gap-3 pt-1">
             <button
               type="button"
               onClick={onClose}
@@ -199,12 +303,14 @@ export const ClearModal: React.FC<ClearModalProps> = ({
               {loading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Clearing...</span>
+                  <span>Executing...</span>
                 </>
               ) : (
                 <>
                   <Trash2 className="w-4 h-4" />
-                  <span>Execute CLEAR</span>
+                  <span>
+                    {mode === 'everything_and_new_user' ? 'Clear Everything' : 'Clear Messages'}
+                  </span>
                 </>
               )}
             </button>

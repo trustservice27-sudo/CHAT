@@ -29,12 +29,9 @@ import { AuthModal } from './components/AuthModal';
 import { ClearModal } from './components/ClearModal';
 import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
-import { useVisualViewport } from './utils/useVisualViewport';
 import { Loader2, AlertCircle, Sparkles } from 'lucide-react';
 
 export default function App() {
-  const { viewportHeight, isKeyboardVisible } = useVisualViewport();
-
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(() => {
     try {
       const saved = localStorage.getItem('openchat_user');
@@ -60,13 +57,8 @@ export default function App() {
   // Audio trigger tracking
   const initialLoadDone = useRef(false);
   const prevMessagesCount = useRef(0);
-
-  // Auto-scroll when keyboard opens on mobile
-  useEffect(() => {
-    if (isKeyboardVisible) {
-      setScrollTrigger((prev) => prev + 1);
-    }
-  }, [isKeyboardVisible]);
+  const markedSeenRef = useRef<Set<string>>(new Set());
+  const isTypingActiveRef = useRef(false);
 
   // 1. Data Fetching (Live real-time messages from online database)
   useEffect(() => {
@@ -124,20 +116,24 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, soundEnabled]);
 
-  // Mark other users' messages as seen by current user in real-time
+  // Mark only recent new messages as seen once per message without write loops
   useEffect(() => {
     if (!currentUser || messages.length === 0) return;
 
-    const unreadMessages = messages.filter(
+    // Check only the 5 most recent messages to keep Firestore fast and light
+    const recent = messages.slice(-5);
+    const unread = recent.filter(
       (m) =>
         m.userId &&
         m.userId !== currentUser.uid &&
+        !markedSeenRef.current.has(m.id) &&
         (!m.readBy || !m.readBy.includes(currentUser.uid))
     );
 
-    if (unreadMessages.length === 0) return;
+    if (unread.length === 0) return;
 
-    unreadMessages.forEach((msg) => {
+    unread.forEach((msg) => {
+      markedSeenRef.current.add(msg.id);
       updateDoc(doc(db, 'messages', msg.id), {
         readBy: arrayUnion(currentUser.uid),
         seenBy: arrayUnion({
@@ -145,8 +141,8 @@ export default function App() {
           displayName: currentUser.displayName,
           seenAt: Date.now(),
         }),
-      }).catch((err) => {
-        console.warn('Failed to mark message as seen:', err);
+      }).catch(() => {
+        // Silently catch to prevent disruption
       });
     });
   }, [messages, currentUser]);
@@ -210,7 +206,6 @@ export default function App() {
 
         setTypingUsers(activeTypers);
 
-        // Auto-scroll when someone starts typing if user was near bottom
         if (activeTypers.length > 0) {
           setScrollTrigger((prev) => prev + 1);
         }
@@ -250,10 +245,9 @@ export default function App() {
       localStorage.setItem('openchat_user', JSON.stringify(user));
       localStorage.setItem('openchat_uid', user.uid);
     } catch {
-      // Ignore localStorage exceptions in private browsing
+      // Ignore
     }
 
-    // Save user profile into ONLINE DATABASE (Firestore)
     try {
       await setDoc(doc(db, 'users', user.uid), {
         userId: user.uid,
@@ -280,14 +274,16 @@ export default function App() {
     setCurrentUser(null);
     try {
       localStorage.removeItem('openchat_user');
+      localStorage.removeItem('openchat_uid');
     } catch {
       // Ignore
     }
   };
 
-  // Broadcast typing status to Firestore
+  // Broadcast typing status to Firestore without redundant writes
   const handleTyping = async (isTyping: boolean) => {
-    if (!currentUser) return;
+    if (!currentUser || isTypingActiveRef.current === isTyping) return;
+    isTypingActiveRef.current = isTyping;
     try {
       await setDoc(doc(db, 'typing', currentUser.uid), {
         userId: currentUser.uid,
@@ -295,43 +291,72 @@ export default function App() {
         isTyping,
         timestamp: Date.now(),
       }, { merge: true });
-    } catch (err) {
-      console.warn('Failed to update typing status:', err);
+    } catch {
+      // Ignore
     }
   };
 
-  // Send message directly to ONLINE DATABASE
+  // Send message directly to ONLINE DATABASE with instant optimistic update
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
+
+    const trimmed = text.trim();
+    if (!trimmed) return;
 
     const path = 'messages';
     const payload = {
       userId: currentUser.uid,
       displayName: currentUser.displayName,
-      text: text.trim(),
+      text: trimmed,
       createdAt: serverTimestamp(),
+      readBy: [currentUser.uid],
+      seenBy: [{
+        userId: currentUser.uid,
+        displayName: currentUser.displayName,
+        seenAt: Date.now(),
+      }],
     };
+
+    // Optimistic message displayed immediately in chat (0ms lag)
+    const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const optimisticMessage: ChatMessage = {
+      id: tempId,
+      userId: currentUser.uid,
+      displayName: currentUser.displayName,
+      photoURL: currentUser.photoURL,
+      text: trimmed,
+      createdAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
+      readBy: [currentUser.uid],
+      seenBy: [],
+    };
+
+    setMessages((prev) => [...prev, optimisticMessage]);
 
     try {
       await addDoc(collection(db, path), payload);
 
       // Clear typing status immediately
+      isTypingActiveRef.current = false;
       setDoc(doc(db, 'typing', currentUser.uid), {
         userId: currentUser.uid,
         displayName: currentUser.displayName,
         isTyping: false,
         timestamp: Date.now(),
       }, { merge: true }).catch(() => {});
-
-      // Refresh lastActive in online database
-      setDoc(doc(db, 'users', currentUser.uid), {
-        userId: currentUser.uid,
-        displayName: currentUser.displayName,
-        lastActive: serverTimestamp(),
-      }, { merge: true }).catch(() => {});
-    } catch (error) {
+    } catch (error: any) {
+      // Remove optimistic message if send failed
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
       handleFirestoreError(error, OperationType.CREATE, path);
+      throw error;
     }
+  };
+
+  // Reset Everything handler (clears state, signs out, returns to join screen)
+  const handleResetEverything = () => {
+    setMessages([]);
+    setOnlineUsers([]);
+    setTypingUsers([]);
+    setCurrentUser(null);
   };
 
   // Filter messages based on search query
@@ -345,12 +370,9 @@ export default function App() {
   });
 
   return (
-    <div 
-      style={{ height: viewportHeight ? `${viewportHeight}px` : undefined }}
-      className="h-dvh max-h-dvh w-full overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30 fixed inset-0"
-    >
+    <div className="h-dvh max-h-dvh w-full overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30">
       
-      {/* Top Header (shrink-0 fixed at top) */}
+      {/* Top Header */}
       <Header
         currentUser={currentUser}
         onSignOut={handleSignOut}
@@ -363,7 +385,7 @@ export default function App() {
         messageCount={messages.length}
       />
 
-      {/* Online Database Active Users Bar (shrink-0) */}
+      {/* Online Database Active Users Bar */}
       {currentUser && onlineUsers.length > 0 && (
         <div className="shrink-0 bg-slate-900/60 border-b border-slate-800/80 px-3 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between text-xs">
           <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar py-0.5">
@@ -395,7 +417,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content Area (flex-1 min-h-0) */}
+      {/* Main Content Area */}
       <main className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
         {!currentUser ? (
           /* Simple Instant Name Login Screen */
@@ -429,10 +451,10 @@ export default function App() {
               />
             )}
 
-            {/* Real-time Typing Indicator (placed right above composer) */}
+            {/* Real-time Typing Indicator */}
             <TypingIndicator typingUsers={typingUsers} />
 
-            {/* Message input bar (shrink-0 fixed at bottom) */}
+            {/* Message input bar (clean, instant send, regular mobile keyboard) */}
             <MessageComposer
               currentUser={currentUser}
               onSendMessage={handleSendMessage}
@@ -451,6 +473,7 @@ export default function App() {
         onCleared={() => {
           setMessages([]);
         }}
+        onResetAll={handleResetEverything}
       />
 
       <InfoModal
