@@ -23,13 +23,13 @@ app.get('/api/clear-status', (req, res) => {
   });
 });
 
-// API: Clear chat password verification
+// API: Clear chat password verification for clearing the online database
 app.post('/api/clear-chat', (req, res) => {
   try {
     const enteredPassword = (req.body?.password || '').trim();
     const serverPassword = (process.env.CLEAR_PASSWORD || 'ADMIN').trim();
 
-    if (!enteredPassword || enteredPassword !== serverPassword) {
+    if (!enteredPassword || enteredPassword.toUpperCase() !== serverPassword.toUpperCase()) {
       res.status(401).json({ 
         success: false, 
         error: 'Incorrect security code. Access denied.' 
@@ -40,7 +40,7 @@ app.post('/api/clear-chat', (req, res) => {
     res.status(200).json({ 
       success: true, 
       authorized: true, 
-      message: 'Authorization verified. Messages cleared.' 
+      message: 'Authorization verified.' 
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message || 'Server error' });

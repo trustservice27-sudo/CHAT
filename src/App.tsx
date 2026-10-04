@@ -13,8 +13,6 @@ import {
   onSnapshot, 
   addDoc, 
   setDoc,
-  updateDoc,
-  arrayUnion,
   doc,
   serverTimestamp, 
   handleFirestoreError, 
@@ -29,7 +27,7 @@ import { AuthModal } from './components/AuthModal';
 import { ClearModal } from './components/ClearModal';
 import { InfoModal } from './components/InfoModal';
 import { playNotificationSound } from './utils/sound';
-import { Loader2, AlertCircle, Sparkles } from 'lucide-react';
+import { Loader2, Sparkles, Database } from 'lucide-react';
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<ChatUser | null>(() => {
@@ -45,7 +43,6 @@ export default function App() {
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(true);
-  const [firestoreError, setFirestoreError] = useState<string | null>(null);
 
   // UI state
   const [searchQuery, setSearchQuery] = useState('');
@@ -57,19 +54,17 @@ export default function App() {
   // Audio trigger tracking
   const initialLoadDone = useRef(false);
   const prevMessagesCount = useRef(0);
-  const markedSeenRef = useRef<Set<string>>(new Set());
   const isTypingActiveRef = useRef(false);
 
-  // 1. Data Fetching (Live real-time messages from online database)
+  // 1. ALL MESSAGES saved & synced directly in the ONLINE DATABASE (Firestore)
   useEffect(() => {
     setMessagesLoading(true);
-    setFirestoreError(null);
 
     const path = 'messages';
     const messagesQuery = query(
       collection(db, path),
       orderBy('createdAt', 'asc'),
-      limit(200)
+      limit(50)
     );
 
     const unsubscribe = onSnapshot(
@@ -89,7 +84,7 @@ export default function App() {
           };
         });
 
-        // Trigger chime on new incoming message from someone else
+        // Chime for incoming message from other online users
         if (
           initialLoadDone.current &&
           loaded.length > prevMessagesCount.current &&
@@ -108,53 +103,17 @@ export default function App() {
       },
       (error) => {
         setMessagesLoading(false);
-        const errMsg = error?.message || '';
-        // Suppress quota exceeded and internal resource messages from UI
-        if (
-          !errMsg.toLowerCase().includes('quota') &&
-          !errMsg.toLowerCase().includes('resource_exhausted')
-        ) {
-          setFirestoreError(errMsg);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        if (!errMsg.toLowerCase().includes('quota')) {
+          handleFirestoreError(error, OperationType.GET, path);
         }
-        handleFirestoreError(error, OperationType.GET, path);
       }
     );
 
     return () => unsubscribe();
   }, [currentUser, soundEnabled]);
 
-  // Mark only recent new messages as seen once per message without write loops
-  useEffect(() => {
-    if (!currentUser || messages.length === 0) return;
-
-    // Check only the 5 most recent messages to keep Firestore fast and light
-    const recent = messages.slice(-5);
-    const unread = recent.filter(
-      (m) =>
-        m.userId &&
-        m.userId !== currentUser.uid &&
-        !markedSeenRef.current.has(m.id) &&
-        (!m.readBy || !m.readBy.includes(currentUser.uid))
-    );
-
-    if (unread.length === 0) return;
-
-    unread.forEach((msg) => {
-      markedSeenRef.current.add(msg.id);
-      updateDoc(doc(db, 'messages', msg.id), {
-        readBy: arrayUnion(currentUser.uid),
-        seenBy: arrayUnion({
-          userId: currentUser.uid,
-          displayName: currentUser.displayName,
-          seenAt: Date.now(),
-        }),
-      }).catch(() => {
-        // Silently catch to prevent disruption
-      });
-    });
-  }, [messages, currentUser]);
-
-  // 2. Data Fetching (Live real-time active users from online database)
+  // 2. ALL ONLINE USERS saved & synced directly in the ONLINE DATABASE (Firestore)
   useEffect(() => {
     const usersPath = 'users';
     const usersQuery = query(
@@ -165,87 +124,93 @@ export default function App() {
     const unsubscribe = onSnapshot(
       usersQuery,
       (snapshot) => {
-        const users: OnlineUser[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          return {
-            userId: docSnap.id,
-            displayName: data.displayName || 'Member',
-            lastActive: data.lastActive || null,
-          };
-        });
+        const now = Date.now();
+        const users: OnlineUser[] = snapshot.docs
+          .map((docSnap) => {
+            const data = docSnap.data();
+            return {
+              userId: docSnap.id,
+              displayName: data.displayName || 'Member',
+              lastActive: data.lastActive,
+            };
+          })
+          .filter((u) => {
+            if (!u.lastActive) return true;
+            const seconds = typeof u.lastActive.seconds === 'number' 
+              ? u.lastActive.seconds 
+              : Math.floor(now / 1000);
+            return (now / 1000 - seconds) < 90; // Active in last 90 seconds
+          });
+
         setOnlineUsers(users);
       },
-      (err) => {
-        console.warn('Online users listener:', err);
+      (error) => {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        if (!errMsg.toLowerCase().includes('quota')) {
+          handleFirestoreError(error, OperationType.LIST, usersPath);
+        }
       }
     );
 
     return () => unsubscribe();
   }, []);
 
-  // 3. Real-time Typing Status Listener
+  // 3. ALL TYPING STATUS saved & synced directly in the ONLINE DATABASE (Firestore)
   useEffect(() => {
-    const typingQuery = query(collection(db, 'typing'));
-
+    const typingPath = 'typing';
     const unsubscribe = onSnapshot(
-      typingQuery,
+      collection(db, typingPath),
       (snapshot) => {
         const now = Date.now();
-        const activeTypers: TypingUser[] = [];
+        const active: TypingUser[] = [];
 
         snapshot.docs.forEach((docSnap) => {
           const data = docSnap.data();
-          // Exclude self, require isTyping = true, and ignore stale events > 5s old
           if (
             data.isTyping &&
             data.userId !== currentUser?.uid &&
-            data.displayName &&
             now - (data.timestamp || 0) < 5000
           ) {
-            activeTypers.push({
-              userId: data.userId || docSnap.id,
+            active.push({
+              userId: data.userId,
               displayName: data.displayName || 'Someone',
               isTyping: true,
-              timestamp: data.timestamp || now,
+              timestamp: data.timestamp,
             });
           }
         });
 
-        setTypingUsers(activeTypers);
-
-        if (activeTypers.length > 0) {
-          setScrollTrigger((prev) => prev + 1);
-        }
+        setTypingUsers(active);
       },
-      (err) => {
-        console.warn('Typing status listener error:', err);
+      (error) => {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        if (!errMsg.toLowerCase().includes('quota')) {
+          handleFirestoreError(error, OperationType.LIST, typingPath);
+        }
       }
     );
 
-    // Periodic sweep to remove expired typing entries
-    const interval = setInterval(() => {
-      const now = Date.now();
-      setTypingUsers((prev) => prev.filter((t) => now - t.timestamp < 5000));
-    }, 2000);
-
-    return () => {
-      unsubscribe();
-      clearInterval(interval);
-    };
+    return () => unsubscribe();
   }, [currentUser]);
 
-  // Sync current user to online database on initial load if logged in
+  // 4. Online Presence Heartbeat saved directly to ONLINE DATABASE
   useEffect(() => {
-    if (currentUser) {
+    if (!currentUser) return;
+
+    const pingOnlineDatabase = () => {
       setDoc(doc(db, 'users', currentUser.uid), {
         userId: currentUser.uid,
         displayName: currentUser.displayName,
         lastActive: serverTimestamp(),
       }, { merge: true }).catch(() => {});
-    }
+    };
+
+    pingOnlineDatabase();
+    const interval = setInterval(pingOnlineDatabase, 30000);
+    return () => clearInterval(interval);
   }, [currentUser]);
 
-  // Join handler (Persist in local storage & save in online database)
+  // Join handler
   const handleJoin = async (user: ChatUser) => {
     setCurrentUser(user);
     try {
@@ -255,21 +220,19 @@ export default function App() {
       // Ignore
     }
 
-    try {
-      await setDoc(doc(db, 'users', user.uid), {
-        userId: user.uid,
-        displayName: user.displayName,
-        lastActive: serverTimestamp(),
-      }, { merge: true });
-    } catch (err) {
-      console.warn('Failed to save user to online database', err);
-    }
+    // Save directly to the online database
+    setDoc(doc(db, 'users', user.uid), {
+      userId: user.uid,
+      displayName: user.displayName,
+      lastActive: serverTimestamp(),
+    }, { merge: true }).catch((err) => {
+      handleFirestoreError(err, OperationType.WRITE, 'users');
+    });
   };
 
   // Leave room handler
   const handleSignOut = () => {
     if (currentUser) {
-      // Clean up typing status
       setDoc(doc(db, 'typing', currentUser.uid), {
         userId: currentUser.uid,
         displayName: currentUser.displayName,
@@ -287,23 +250,20 @@ export default function App() {
     }
   };
 
-  // Broadcast typing status to Firestore without redundant writes
-  const handleTyping = async (isTyping: boolean) => {
+  // Broadcast typing status directly to ONLINE DATABASE
+  const handleTyping = (isTyping: boolean) => {
     if (!currentUser || isTypingActiveRef.current === isTyping) return;
     isTypingActiveRef.current = isTyping;
-    try {
-      await setDoc(doc(db, 'typing', currentUser.uid), {
-        userId: currentUser.uid,
-        displayName: currentUser.displayName,
-        isTyping,
-        timestamp: Date.now(),
-      }, { merge: true });
-    } catch {
-      // Ignore
-    }
+
+    setDoc(doc(db, 'typing', currentUser.uid), {
+      userId: currentUser.uid,
+      displayName: currentUser.displayName,
+      isTyping,
+      timestamp: Date.now(),
+    }, { merge: true }).catch(() => {});
   };
 
-  // Send message directly to ONLINE DATABASE with instant optimistic update
+  // Send message directly to the ONLINE DATABASE
   const handleSendMessage = async (text: string) => {
     if (!currentUser) return;
 
@@ -324,7 +284,7 @@ export default function App() {
       }],
     };
 
-    // Optimistic message displayed immediately in chat (0ms lag)
+    // Instant optimistic render on screen
     const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const optimisticMessage: ChatMessage = {
       id: tempId,
@@ -340,9 +300,10 @@ export default function App() {
     setMessages((prev) => [...prev, optimisticMessage]);
 
     try {
+      // Direct save to online database (Firestore)
       await addDoc(collection(db, path), payload);
 
-      // Clear typing status immediately
+      // Clear typing in online database
       isTypingActiveRef.current = false;
       setDoc(doc(db, 'typing', currentUser.uid), {
         userId: currentUser.uid,
@@ -351,14 +312,13 @@ export default function App() {
         timestamp: Date.now(),
       }, { merge: true }).catch(() => {});
     } catch (error: any) {
-      // Remove optimistic message if send failed
       setMessages((prev) => prev.filter((m) => m.id !== tempId));
       handleFirestoreError(error, OperationType.CREATE, path);
       throw error;
     }
   };
 
-  // Reset Everything handler (clears state, signs out, returns to join screen)
+  // Reset Everything handler
   const handleResetEverything = () => {
     setMessages([]);
     setOnlineUsers([]);
@@ -392,19 +352,19 @@ export default function App() {
         messageCount={messages.length}
       />
 
-      {/* Online Database Active Users Bar */}
-      {currentUser && onlineUsers.length > 0 && (
+      {/* Online Database Live Status Bar */}
+      {currentUser && (
         <div className="shrink-0 bg-slate-900/60 border-b border-slate-800/80 px-3 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between text-xs">
           <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar py-0.5">
             <span className="text-[10px] sm:text-[11px] font-semibold text-slate-400 flex items-center gap-1 shrink-0 uppercase tracking-wider">
               <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              Online ({onlineUsers.length}):
+              Online ({Math.max(1, onlineUsers.length)}):
             </span>
             <div className="flex items-center -space-x-1 shrink-0">
               {onlineUsers.slice(0, 8).map((u) => (
                 <div 
                   key={u.userId}
-                  title={`${u.displayName} (Online)`}
+                  title={`${u.displayName} (Online Database)`}
                   className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-indigo-600/80 border border-slate-700 text-white font-bold text-[9px] sm:text-[10px] flex items-center justify-center ring-1 ring-slate-900"
                 >
                   {(u.displayName || 'M')[0].toUpperCase()}
@@ -417,9 +377,9 @@ export default function App() {
               </span>
             )}
           </div>
-          <span className="text-[10px] text-indigo-400 font-mono hidden sm:inline-flex items-center gap-1 shrink-0">
-            <Sparkles className="w-3 h-3" />
-            Live Cloud
+          <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline-flex items-center gap-1 shrink-0">
+            <Database className="w-3 h-3 text-emerald-400" />
+            Online Database
           </span>
         </div>
       )}
@@ -434,20 +394,10 @@ export default function App() {
         ) : (
           /* Live Chat Room Layout */
           <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-            
-            {firestoreError && !firestoreError.toLowerCase().includes('quota') && (
-              <div className="shrink-0 max-w-4xl mx-auto w-full px-3 pt-2">
-                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>{firestoreError}</span>
-                </div>
-              </div>
-            )}
-
-            {messagesLoading ? (
+            {messagesLoading && messages.length === 0 ? (
               <div className="flex-1 flex flex-col items-center justify-center text-slate-500 gap-2">
                 <Loader2 className="w-6 h-6 animate-spin text-indigo-400" />
-                <span className="text-xs">Loading live conversation...</span>
+                <span className="text-xs">Connecting to online database...</span>
               </div>
             ) : (
               <MessageList
@@ -461,7 +411,7 @@ export default function App() {
             {/* Real-time Typing Indicator */}
             <TypingIndicator typingUsers={typingUsers} />
 
-            {/* Message input bar (clean, instant send, regular mobile keyboard) */}
+            {/* Message input bar */}
             <MessageComposer
               currentUser={currentUser}
               onSendMessage={handleSendMessage}
